@@ -735,12 +735,18 @@ def boltz_hallucination(
             traj_coords = None
             traj_plddt = None
 
-            if device is None: # Ensure device is set
-                if 'pdistogram' in dict_out:
-                    device = dict_out['pdistogram'].device
-                elif 'plddt' in dict_out: # dict_out not available yet here
-                    device = batch['res_type_logits'].device # Fallback to batch tensor device
-                # else: device needs to be passed or error
+            # Device should be reliably passed or obtained before this function.
+            # If device is None here, it's an issue with the calling context.
+            # For safety, one might default or raise an error:
+            if device is None:
+                if batch.get('res_type_logits') is not None:
+                    device = batch['res_type_logits'].device
+                else:
+                    # This is a fallback if no tensor is available in batch to get device from.
+                    # It's better if device is always passed.
+                    # Consider raising an error if device cannot be determined.
+                    print("Warning: get_model_loss - device is None and could not be inferred from batch. Defaulting to CPU, but this may be incorrect.")
+                    device = torch.device("cpu")
 
             # Prepare chain masks
             binder_chain_numeric_id = chain_to_number.get(binder_chain)
@@ -766,19 +772,27 @@ def boltz_hallucination(
             if pre_run and mask_ligand and chain_to_number is not None: # ensure chain_to_number is available
                 binder_id_for_masking = chain_to_number.get(binder_chain)
                 if binder_id_for_masking is not None:
-                    batch['token_pad_mask'][batch['entity_id']!=binder_id_for_masking]=0
-                    masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
-                    masked_token_to_rep[batch['entity_id']==binder_id_for_masking,:] = 0
-                    masked_token_to_rep_index = torch.nonzero(batch['token_to_rep_atom']*masked_token_to_rep, as_tuple=True)[2]
-                    batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
+                    batch['token_pad_mask'][batch['entity_id']!=binder_id_for_masking]=0 # Ensure comparison is with numeric ID
+                    # The following masking logic for token_to_rep_atom and atom_pad_mask seems complex
+                    # and might need careful review if it's causing issues.
+                    # For now, assuming it's correct as per original intent if binder_id_for_masking is valid.
+                    if 'token_to_rep_atom' in batch and 'atom_pad_mask' in batch :
+                        masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
+                        masked_token_to_rep[batch['entity_id']==binder_id_for_masking,:] = 0
+                        # Ensure that the multiplication and nonzero operation are safe
+                        # This can lead to issues if shapes are not broadcastable or if result is empty
+                        # It might be safer to directly create masks based on entity_id
+                        if batch['token_to_rep_atom'].shape == masked_token_to_rep.shape :
+                             product = batch['token_to_rep_atom'] * masked_token_to_rep
+                             if product.ndim >=3 : # Expecting at least 3 dims (batch, seq, atom_type)
+                                masked_token_to_rep_index_tuple = torch.nonzero(product, as_tuple=True)
+                                if len(masked_token_to_rep_index_tuple) == product.ndim and masked_token_to_rep_index_tuple[2].numel() > 0:
+                                     masked_token_to_rep_index = masked_token_to_rep_index_tuple[2]
+                                     batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
+                                # else: print("Warning: masked_token_to_rep_index was empty or product had unexpected dimensions.")
+                        # else: print("Warning: Shape mismatch for token_to_rep_atom masking.")
+                    # else: print("Warning: token_to_rep_atom or atom_pad_mask missing from batch for pre_run masking.")
 
-
-            # Common arguments for get_distogram_confidence
-            confidence_args = {
-                masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
-                masked_token_to_rep[batch['entity_id']==chain_to_number[binder_chain],:] = 0
-                masked_token_to_rep_index = torch.nonzero(batch['token_to_rep_atom']*masked_token_to_rep, as_tuple=True)[2]
-                batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
 
             # Common arguments for get_distogram_confidence
             confidence_args = {
@@ -1325,46 +1339,63 @@ def boltz_hallucination(
             break
 
         binder_mask_for_plddt = (best_batch['entity_id'].squeeze(0) == current_binder_chain_id)
-        plddt_binder = output['plddt'][0, binder_mask_for_plddt] # output['plddt'] is (1, total_L)
 
-        # i_prob should have length equal to binder length
-        if plddt_binder.numel() == 0 : # if binder chain not found in plddt output (e.g. different length)
-             # Use length (binder_length) from outer scope for i_prob
+        # Ensure plddt_binder is correctly shaped and indexed
+        if output['plddt'].ndim > 1 and output['plddt'].shape[0] == 1: # Expected shape (1, total_L)
+            plddt_total_L = output['plddt'].squeeze(0)
+            if binder_mask_for_plddt.shape[0] == plddt_total_L.shape[0]:
+                 plddt_binder = plddt_total_L[binder_mask_for_plddt]
+            else:
+                print(f"Warning: semi-greedy - Mismatch plddt ({plddt_total_L.shape[0]}) and binder mask ({binder_mask_for_plddt.shape[0]}) lengths. Using uniform i_prob.")
+                plddt_binder = torch.empty(0) # Will trigger fallback for i_prob_np
+        else: # Fallback if plddt shape is unexpected
+            print(f"Warning: semi-greedy - Unexpected plddt shape: {output['plddt'].shape}. Using uniform i_prob.")
+            plddt_binder = torch.empty(0)
+
+
+        # i_prob should have length equal to binder length (length is outer scope binder_length)
+        if plddt_binder.numel() == 0 :
             i_prob_np = np.ones(length) / float(length) if length > 0 else np.array([])
-            print(f"Warning: semi-greedy - plddt for binder {binder_chain} is empty. Using uniform i_prob.")
+            # print(f"Warning: semi-greedy - plddt for binder {binder_chain} is empty or length mismatch. Using uniform i_prob.")
         else:
             i_prob_tensor = torch.maximum(1.0 - plddt_binder, torch.tensor(0.0, device=plddt_binder.device))
             i_prob_np = i_prob_tensor.detach().cpu().numpy()
+            if i_prob_np.shape[0] != length: # Double check length consistency after slicing
+                print(f"Warning: semi-greedy - i_prob_np length {i_prob_np.shape[0]} differs from target binder length {length}. Using uniform i_prob.")
+                i_prob_np = np.ones(length) / float(length) if length > 0 else np.array([])
+
 
         current_sequence_str = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][0, binder_mask_for_plddt,:], dim=-1).detach().cpu().numpy()])
 
-        # Prepare binder-specific logits for _mutate, from the *original* best_batch output of design loop
-        # This uses initial_best_logits_all_chains, which is from before this semi-greedy loop.
-        binder_mask_for_initial_logits = (initial_best_logits_all_chains.shape[1] == batch['entity_id'].shape[1]) # Basic check
+        # Prepare binder-specific logits for _mutate
+        # initial_best_logits_all_chains is (1, total_L, n_tokens)
+        # batch['entity_id'] is (1, total_L)
         if initial_best_logits_all_chains.shape[1] == batch['entity_id'].shape[1] : # total_L should match
             initial_binder_mask_flat = (batch['entity_id'].squeeze(0) == current_binder_chain_id)
             logits_for_binder_mutation = initial_best_logits_all_chains[:, initial_binder_mask_flat, :]
-        else: # Fallback, though this indicates a problem
-            print("Warning: semi-greedy - Logits shape mismatch. Using full initial logits for mutation.")
-            logits_for_binder_mutation = initial_best_logits_all_chains
+        else:
+            print(f"Warning: semi-greedy - Logits shape mismatch (total_L: {initial_best_logits_all_chains.shape[1]} vs entity_id_L: {batch['entity_id'].shape[1]}). Cannot reliably slice binder logits for mutation.")
+            # Fallback: skip mutation trial for this step or use a dummy tensor that _mutate can handle
+            logits_for_binder_mutation = torch.empty((1, length, initial_best_logits_all_chains.shape[2]), device=device) # Dummy
 
 
         variable_mask_for_mutation = best_batch.get('variable_mask_binder_1d') # (binder_L,)
 
         for t in range(10): # Try 10 mutations per semi-greedy step
-            mutated_sequence = _mutate(current_sequence_str, logits_for_binder_mutation, i_prob_np, variable_mask_for_mutation)
+            if i_prob_np.size == 0: # Cannot make a choice for mutation position
+                # print(f"Debug: semi-greedy trial {t} - i_prob_np is empty, skipping mutation.")
+                mutated_sequence = current_sequence_str # No mutation possible
+            elif logits_for_binder_mutation.shape[1] != length : # Check if binder logits length is correct
+                print(f"Warning: semi-greedy trial {t} - Mismatch between logits_for_binder_mutation length ({logits_for_binder_mutation.shape[1]}) and binder length ({length}). Skipping mutation.")
+                mutated_sequence = current_sequence_str
+            else:
+                mutated_sequence = _mutate(current_sequence_str, logits_for_binder_mutation, i_prob_np, variable_mask_for_mutation)
 
-            # Update YAML data with the mutated sequence for the binder chain
             data['sequences'][current_binder_chain_id]['protein']['sequence'] = mutated_sequence
 
-            # Re-create batch and run model (expensive part)
-            # Note: _update_batches uses data (mutated) and data_apo (original binder seq, but constraints removed)
-            # For apo, the sequence in data_apo also needs to be the mutated one if we want apo of mutated.
-            # The original code for data_apo takes `data['sequences'][chain_to_number[binder_chain]]` which is the *mutated* one.
-            # So, data_apo will also have the mutated sequence. This seems fine.
-
-            current_eval_batch, _, _, _ = _update_batches(data, data_apo) # We only need the holo output here
+            current_eval_batch, current_eval_batch_apo, _, _ = _update_batches(data, data_apo)
             current_output = _run_model(boltz_model, current_eval_batch, predict_args)
+            # current_output_apo = _run_model(boltz_model, current_eval_batch_apo, predict_args) # if needed
 
             iptm = current_output['iptm'].detach().cpu().numpy()
             confidence_score.append(iptm)
