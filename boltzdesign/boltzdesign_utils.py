@@ -33,6 +33,50 @@ import logging
 
 logging.basicConfig(level=logging.WARNING)
 
+# Amino acid conversion dictionaries
+AA_3_TO_1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V"
+}
+AA_1_TO_3 = {v: k for k, v in AA_3_TO_1.items()}
+
+def get_fixed_residue_properties(fixed_residues_info_1_letter, binder_chain_len, device, tokens_list):
+    # fixed_residues_info_1_letter: list of tuples, e.g., [('C', 0), ('Y', 5)] (1-letter AA codes)
+    # binder_chain_len: integer length of the binder chain
+    # device: torch device
+    # tokens_list: the global 'tokens' list
+
+    fixed_mask_1d_binder = torch.zeros(binder_chain_len, dtype=torch.bool, device=device)
+    fixed_aa_token_indices_list = []
+    fixed_positions_in_binder_list = []
+
+    if fixed_residues_info_1_letter:
+        for aa_char_1_letter, res_idx_in_binder in fixed_residues_info_1_letter:
+            if not (0 <= res_idx_in_binder < binder_chain_len):
+                logging.warning(f"Position {res_idx_in_binder} in fixed_residues_info is out of bounds for binder length {binder_chain_len}. Skipping.")
+                continue
+
+            aa_char_3_letter = AA_1_TO_3.get(aa_char_1_letter.upper())
+            if not aa_char_3_letter:
+                logging.warning(f"Amino acid 1-letter code {aa_char_1_letter} could not be converted to 3-letter code. Skipping.")
+                continue
+
+            try:
+                token_idx = tokens_list.index(aa_char_3_letter)
+                fixed_mask_1d_binder[res_idx_in_binder] = True
+                fixed_aa_token_indices_list.append(token_idx)
+                fixed_positions_in_binder_list.append(res_idx_in_binder)
+            except ValueError:
+                logging.warning(f"Amino acid 3-letter code {aa_char_3_letter} (from {aa_char_1_letter}) not found in tokens list. Skipping.")
+
+    variable_mask_1d_binder = ~fixed_mask_1d_binder
+    fixed_aa_token_indices = torch.tensor(fixed_aa_token_indices_list, dtype=torch.long, device=device)
+    fixed_positions_in_binder = torch.tensor(fixed_positions_in_binder_list, dtype=torch.long, device=device)
+
+    return fixed_mask_1d_binder, variable_mask_1d_binder, fixed_aa_token_indices, fixed_positions_in_binder
+
 def save_confidence_scores(folder_dir, output, structure,name, model_idx=0):
     output_dir = os.path.join(folder_dir, f"boltz_results_{name}", "predictions", name)
 
@@ -497,10 +541,32 @@ def boltz_hallucination(
     with yaml_path.open("r") as file:
         data = yaml.safe_load(file)
 
-    data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = 'X'*length
+    # Parameter Handling & Initialization for fixed residues
+    binder_chain_letter = binder_chain
+    binder_chain_num_idx = chain_to_number[binder_chain_letter]
+    binder_protein_info = data['sequences'][binder_chain_num_idx]['protein']
+    binder_sequence_from_yaml = binder_protein_info['sequence']
+
+    # Override 'length' parameter with the actual length from YAML
+    length = len(binder_sequence_from_yaml)
+
+    # The line data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = 'X'*length
+    # is removed because the sequence is now read from YAML. If fixed residues are present,
+    # the sequence in YAML (e.g., "CXXXXXC") is the source of truth for length and content.
+    # If 'fixed_residues' is not in YAML, input_utils.py would have set 'sequence' to 'X'*100 (default) or from binder_native_sequence.
+
+    fixed_residues_info_1_letter = binder_protein_info.get('fixed_residues') # List[Tuple[str, int]] or None
+
     name = yaml_path.stem
-    target = parse_boltz_schema(name, data, ccd_lib)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    target = parse_boltz_schema(name, data, ccd_lib) # data now contains the potentially fixed sequence
+
+    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # Original line
+    # Assuming boltz_model is already on the correct device or device is determined globally
+    device = boltz_model.device # Make sure boltz_model has a .device attribute
+
+    fixed_mask_1d_binder, variable_mask_1d_binder, fixed_aa_tokens, fixed_binder_positions = \
+        get_fixed_residue_properties(fixed_residues_info_1_letter, length, device, tokens)
+
     boltz_model.train() if set_train else boltz_model.eval()
     print(f"set in {'train' if set_train else 'eval'} mode")
 
@@ -567,14 +633,52 @@ def boltz_hallucination(
     
     batch, structure = get_batch(target, max_seqs=msa_max_seqs, length=length, pocket_conditioning=pocket_conditioning)
     batch = {key: value.unsqueeze(0).to(device) for key, value in batch.items()}
+
+    # Batch Initialization & Fixed Residue Application
+    binder_entity_mask_for_slicing = (batch['entity_id'] == binder_chain_num_idx).squeeze(0) # Used for slicing binder parts
+
+    if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
+        # Ensure res_type and res_type_logits are float for modification
+        batch['res_type'] = batch['res_type'].float()
+        # Ensure res_type_logits exists and is float. It's initialized later, so we might need to defer this part or ensure it's initialized before.
+        # For now, let's assume it will be initialized before this logic is strictly needed by the model.
+        # However, the plan is to initialize it *after* this. So, let's apply to res_type here,
+        # and res_type_logits will be handled after its own initialization.
+        # This means the res_type_logits part of this block needs to move.
+
+        # Apply to res_type (one-hot encoding)
+        res_type_binder_slice = batch['res_type'][0, binder_entity_mask_for_slicing, :]
+        res_type_binder_slice[fixed_binder_positions, :] = 0.0  # Zero out existing AA info at fixed positions
+        res_type_binder_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1.0) # Set fixed AA one-hot
     
     ## initialize res_type_logits
     if pre_run:
-        batch['res_type_logits'] = batch['res_type'].clone().detach().to(device).float()
-        batch['res_type_logits'][batch['entity_id']==chain_to_number[binder_chain],:] = torch.softmax(torch.distributions.Gumbel(0, 1).sample(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:].shape).to(device) - torch.sum(torch.eye(batch['res_type'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10), dim=-1)
+        batch['res_type_logits'] = batch['res_type'].clone().detach().to(device).float() # This is already float
+        # Apply fixed residues to pre_run logits if they exist
+        if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
+            logits_binder_slice_for_pre_run = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+            logits_binder_slice_for_pre_run[fixed_binder_positions, :] = -1e9
+            logits_binder_slice_for_pre_run.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
+        # The original random initialization for the binder chain part:
+        # This should now only apply to *variable* positions if fixed residues are present.
+        # For simplicity, the original line is kept, and fixed positions are overwritten above.
+        # A more precise way would be to apply random init only to variable_mask_1d_binder positions.
+        batch['res_type_logits'][batch['entity_id']==binder_chain_num_idx,:] = torch.softmax(torch.distributions.Gumbel(0, 1).sample(batch['res_type'][batch['entity_id']==binder_chain_num_idx,:].shape).to(device) - torch.sum(torch.eye(batch['res_type'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10), dim=-1)
+        # Re-apply fixed residues to ensure they dominate after Gumbel sampling
+        if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
+            logits_binder_slice_for_pre_run = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :] # re-slice
+            logits_binder_slice_for_pre_run[fixed_binder_positions, :] = -1e9
+            logits_binder_slice_for_pre_run.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
 
-    else:
-        batch['res_type_logits'] = torch.from_numpy(input_res_type).to(device)
+
+    else: # not pre_run
+        batch['res_type_logits'] = torch.from_numpy(input_res_type).to(device).float() # Ensure float
+        # Apply fixed residues to loaded logits if they exist
+        if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
+            logits_binder_slice_loaded = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+            logits_binder_slice_loaded[fixed_binder_positions, :] = -1e9
+            logits_binder_slice_loaded.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
+
 
     if  non_protein_target:
         batch['msa'] = batch['res_type_logits'].unsqueeze(0).to(device)
@@ -649,12 +753,47 @@ def boltz_hallucination(
                 num_inter_contacts=2,
                 num_intra_contacts=4,
                 save_trajectory=False,
+                # Fixed residue parameters added here
+                fixed_residues_info=None,
+                fixed_mask_1d_binder=None,
+                variable_mask_1d_binder=None,
+                fixed_aa_tokens=None,
+                fixed_binder_positions=None,
+                binder_chain_num_idx=None, # Already a global, but passed for clarity/scope
+                binder_entity_mask_for_slicing=None
                 ):
 
         prev_sequence=""
-        def get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run=False, mask_ligand=False, distogram_only=False, predict_args=None, loss_scales=None, binder_chain='A', increasing_contact_over_itr=False, optimize_contact_per_binder_pos=False, num_inter_contacts=2, num_intra_contacts=4,  num_optimizing_binder_pos =1, inter_chain_cutoff=21.0, intra_chain_cutoff=14.0, save_trajectory=False):
+        # Modify get_model_loss signature and logic
+        def get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history,
+                           pre_run=False, mask_ligand=False, distogram_only=False, predict_args=None, loss_scales=None,
+                           binder_chain='A', # This is binder_chain_letter
+                           increasing_contact_over_itr=False, optimize_contact_per_binder_pos=False,
+                           num_inter_contacts=2, num_intra_contacts=4,  num_optimizing_binder_pos =1,
+                           inter_chain_cutoff=21.0, intra_chain_cutoff=14.0, save_trajectory=False,
+                           # New parameters for fixed residues for loss masking
+                           variable_mask_1d_binder=None, binder_entity_mask_for_slicing=None, device=None): # device is already global in hallucination
             traj_coords = None
             traj_plddt = None
+
+            # Create expanded masks for loss calculation
+            # binder_entity_mask_for_slicing is (N_total_tokens_in_batch)
+            # variable_mask_1d_binder is (binder_chain_len)
+
+            # This mask should be True only for variable positions on the binder chain
+            variable_binder_token_mask_expanded = torch.zeros_like(binder_entity_mask_for_slicing, device=device, dtype=torch.bool)
+            if variable_mask_1d_binder is not None and binder_entity_mask_for_slicing is not None:
+                 variable_binder_token_mask_expanded[binder_entity_mask_for_slicing] = variable_mask_1d_binder
+
+            # This mask is True for all non-binder tokens
+            non_binder_token_mask = ~binder_entity_mask_for_slicing
+
+            # chain_mask in the original code was (batch_size, N_total_tokens_in_batch) and True for binder.
+            # For plddt_loss, we need to mask out fixed positions on the binder. So, use variable_binder_token_mask_expanded.
+            # For con_loss (intra-binder), both mask_1d and mask_1b should be variable_binder_token_mask_expanded.
+            # For i_con_loss (inter-binder-target), mask_1d (binder side) is variable_binder_token_mask_expanded, mask_1b (target side) is non_binder_token_mask.
+            # For pae_loss (intra-binder), similar to con_loss.
+            # For i_pae_loss (inter-binder-target), similar to i_con_loss.
 
             # Handle masking first if needed
             if pre_run and mask_ligand:
@@ -692,35 +831,42 @@ def boltz_hallucination(
             mid_pts = get_mid_points(pdist).to(device)
 
             # Calculate contact losses
+            # Intra-binder contacts: only consider variable positions for loss
             con_loss = get_con_loss(pdist, mid_pts,
                                 num=num_intra_contacts, seqsep=9, cutoff=intra_chain_cutoff,
                                 binary=False,
-                                mask_1d=chain_mask, mask_1b=chain_mask)
+                                mask_1d=variable_binder_token_mask_expanded.unsqueeze(0), # Add batch dim
+                                mask_1b=variable_binder_token_mask_expanded.unsqueeze(0))
 
             if optimize_contact_per_binder_pos:
                 if increasing_contact_over_itr:
                     num_optimizing_binder_pos = 0 if pre_run else num_optimizing_binder_pos
+                    # Inter-chain contacts: binder side is variable, target side is all target tokens
                     i_con_loss = get_con_loss(pdist, mid_pts,
                                             num=num_inter_contacts, seqsep=0, num_pos=num_optimizing_binder_pos,
                                             cutoff=inter_chain_cutoff, binary=False, 
-                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
+                                            mask_1d=variable_binder_token_mask_expanded.unsqueeze(0),
+                                            mask_1b=non_binder_token_mask.unsqueeze(0))
                 else:
                     i_con_loss = get_con_loss(pdist, mid_pts,
                                             num=num_inter_contacts, seqsep=0,
                                             cutoff=inter_chain_cutoff, binary=False, 
-                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
-
-            else:
-            
+                                            mask_1d=variable_binder_token_mask_expanded.unsqueeze(0),
+                                            mask_1b=non_binder_token_mask.unsqueeze(0))
+            else: # Original logic for i_con_loss if not optimizing per binder pos
+                # This case might need review: mask_1d=non_binder_token_mask, mask_1b=variable_binder_token_mask_expanded
                 i_con_loss = get_con_loss(pdist, mid_pts,
                                         num=num_inter_contacts, seqsep=0, 
                                         cutoff=inter_chain_cutoff, binary=False, 
-                                        mask_1d=1-chain_mask, mask_1b=chain_mask)
+                                        mask_1d=non_binder_token_mask.unsqueeze(0), # Target side
+                                        mask_1b=variable_binder_token_mask_expanded.unsqueeze(0)) # Binder side (variable)
 
-
-            mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
+            # Helix loss should apply to variable parts of the binder
+            # mask_2d for helix_loss should be (variable_binder_token_mask_expanded_batch_dimmed_unsqueeze_2) * (variable_binder_token_mask_expanded_batch_dimmed_unsqueeze_1)
+            vb_expanded_unsqueezed = variable_binder_token_mask_expanded.unsqueeze(0) # Add batch dim
+            mask_2d_helix = vb_expanded_unsqueezed[:, :, None] * vb_expanded_unsqueezed[:, None, :]
             helix_loss = _get_helix_loss(pdist, mid_pts,
-                                    offset=None, mask_2d=mask_2d, binary=True)
+                                    offset=None, mask_2d=mask_2d_helix, binary=True)
 
 
             if pre_run and mask_ligand:
@@ -736,11 +882,23 @@ def boltz_hallucination(
                     }           
 
             if not pre_run and not distogram_only:
-                plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
+                # pLDDT loss only on variable residues of the binder
+                plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=variable_binder_token_mask_expanded.unsqueeze(0)) # Add batch dim
+
                 pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
-                i_pae_loss = get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask)
-                pae_loss = get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask)
-                rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)
+
+                # Inter-chain PAE loss (binder variable vs target)
+                i_pae_loss = get_pae_loss(pae,
+                                          mask_1d=non_binder_token_mask.unsqueeze(0), # Target
+                                          mask_1b=variable_binder_token_mask_expanded.unsqueeze(0)) # Binder (variable)
+
+                # Intra-binder PAE loss (variable vs variable)
+                pae_loss = get_pae_loss(pae,
+                                        mask_1d=variable_binder_token_mask_expanded.unsqueeze(0),
+                                        mask_1b=variable_binder_token_mask_expanded.unsqueeze(0))
+
+                # Rg loss should use the original binder_chain_letter, as get_ca_coords uses it with chain_to_number
+                rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain) # binder_chain is chain letter
 
                 losses.update({
                     'plddt_loss': plddt_loss,
@@ -778,15 +936,40 @@ def boltz_hallucination(
 
             return total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
         
-        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A'):
+        # Modify update_sequence signature and logic
+        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A', # binder_chain is letter
+                            # New parameters for fixed residues
+                            fixed_residues_info=None, fixed_aa_tokens=None,
+                            fixed_binder_positions=None, binder_entity_mask_for_slicing=None):
             batch["logits"] = alpha*batch['res_type_logits']
-            X =  batch['logits']- torch.sum(torch.eye(batch['logits'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10)
+            # Exclude certain tokens from softmax calculation globally (pad, gap, CYS, UNK, nucleic)
+            # Note: CYS is often specifically handled or allowed, this is a strong exclusion.
+            # This global exclusion might conflict with fixed CYS residues if not handled carefully.
+            # The fixed residue clamping later should override this for specific fixed positions.
+            excluded_indices_for_softmax = [0,1,6,22,23,24,25,26,27,28,29,30,31,32] # Pad, Gap, CYS, UNK, Nucleic
+
+            # Create a mask for allowed tokens in softmax
+            allowed_tokens_mask = torch.ones_like(batch['logits'][0,0,:], dtype=torch.bool, device=device)
+            allowed_tokens_mask[excluded_indices_for_softmax] = False
+
+            X = batch['logits'].clone() # Clone to avoid modifying res_type_logits directly here
+            X[..., ~allowed_tokens_mask] = -1e9 # Apply penalty to excluded tokens for softmax
+
             batch['soft'] = torch.softmax(X/opt["temp"],dim=-1)
             batch['hard'] =  torch.zeros_like(batch['soft']).scatter_(-1, batch['soft'].max(dim=-1, keepdim=True)[1], 1.0)
             batch['hard'] =  (batch['hard'] - batch['soft']).detach() + batch['soft']
-            batch['pseudo'] =  opt["soft"] * batch["soft"] + (1-opt["soft"]) * batch["res_type_logits"]
+            batch['pseudo'] =  opt["soft"] * batch["soft"] + (1-opt["soft"]) * batch["res_type_logits"] # use original logits for pseudo
             batch['pseudo'] = opt["hard"] * batch["hard"] + (1-opt["hard"]) * batch["pseudo"]
+
+            # Original application of mask (presumably to apply pseudo only to binder)
             batch['res_type'] = batch['pseudo']*mask + batch['res_type_logits']*(1-mask)
+
+            # Clamp res_type for fixed residues on the binder chain
+            if fixed_residues_info is not None and len(fixed_aa_tokens) > 0 and binder_entity_mask_for_slicing is not None:
+                with torch.no_grad():
+                    res_type_binder_slice_in_update = batch['res_type'][0, binder_entity_mask_for_slicing, :]
+                    res_type_binder_slice_in_update[fixed_binder_positions, :] = 0.0
+                    res_type_binder_slice_in_update.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1.0)
         
             if non_protein_target:
                 batch['msa'] = batch['res_type'].unsqueeze(0).to(device).detach()
@@ -819,9 +1002,26 @@ def boltz_hallucination(
                 param_group['lr'] = learning_rate * lr_scale
 
             opt["lr_rate"] = learning_rate * lr_scale
-                
-            batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=binder_chain)
-            total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run, mask_ligand, distogram_only, predict_args, loss_scales, binder_chain, increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, num_inter_contacts= num_inter_contacts, num_intra_contacts=num_intra_contacts, num_optimizing_binder_pos=num_optimizing_binder_pos, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, save_trajectory = save_trajectory)
+
+            # Update call to update_sequence
+            batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=binder_chain, # binder_chain is letter
+                                    fixed_residues_info=fixed_residues_info, fixed_aa_tokens=fixed_aa_tokens,
+                                    fixed_binder_positions=fixed_binder_positions,
+                                    binder_entity_mask_for_slicing=binder_entity_mask_for_slicing)
+
+            # Update call to get_model_loss
+            total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(
+                batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history,
+                pre_run, mask_ligand, distogram_only, predict_args, loss_scales, binder_chain, # binder_chain is letter
+                increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+                num_inter_contacts= num_inter_contacts, num_intra_contacts=num_intra_contacts,
+                num_optimizing_binder_pos=num_optimizing_binder_pos, inter_chain_cutoff=inter_chain_cutoff,
+                intra_chain_cutoff=intra_chain_cutoff, save_trajectory = save_trajectory,
+                # Pass new mask parameters
+                variable_mask_1d_binder=variable_mask_1d_binder,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing,
+                device=device # Pass device
+            )
             traj_coords_list.append(traj_coords)
             traj_plddt_list.append(traj_plddt)
             current_sequence = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
@@ -830,25 +1030,74 @@ def boltz_hallucination(
                 diff_percentage = (diff_count / length) * 100
             prev_sequence = current_sequence
             total_loss.backward()
+
+            # Gradient Masking for fixed residues
             if batch['res_type_logits'].grad is not None:
-                batch['res_type_logits'].grad[batch['entity_id']!=chain_to_number[binder_chain],:] = 0
-                batch['res_type_logits'].grad[..., [0,1,6,22,23,24,25,26,27,28,29,30,31,32]] = 0
-                batch['res_type_logits'].grad = norm_seq_grad(batch['res_type_logits'].grad, chain_mask)
+                # Original gradient masking for non-binder chains and excluded tokens
+                batch['res_type_logits'].grad[batch['entity_id']!=binder_chain_num_idx,:] = 0 # Use binder_chain_num_idx consistently
+                batch['res_type_logits'].grad[..., [0,1,6,22,23,24,25,26,27,28,29,30,31,32]] = 0 # Exclude pad, gap, CYS, UNK, nucleic
+
+                # Apply fixed residue gradient masking for the binder chain
+                if fixed_residues_info is not None and len(fixed_aa_tokens) > 0:
+                    # binder_entity_mask_for_slicing should be available from the design function's parameters
+                    grad_binder_slice = batch['res_type_logits'].grad[0, binder_entity_mask_for_slicing, :]
+                    grad_binder_slice[fixed_binder_positions, :] = 0.0
+
+                batch['res_type_logits'].grad = norm_seq_grad(batch['res_type_logits'].grad, chain_mask) # chain_mask is for binder
                 optimizer.step()
+
+                # Logits Clamping for fixed residues
+                if fixed_residues_info is not None and len(fixed_aa_tokens) > 0:
+                    with torch.no_grad():
+                        current_logits_binder_slice = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+                        current_logits_binder_slice[fixed_binder_positions, :] = -1e9 # Others very unlikely
+                        current_logits_binder_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9) # Fixed AA very likely
+
                 optimizer.zero_grad()
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss.item():.2f}, {loss_str}")
         
         return batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
 
+    # Ensure all newly added parameters to 'design' are passed in these calls
+    # This requires adding fixed_residues_info, fixed_mask_1d_binder, etc. to these calls.
+
     if pre_run:
-        batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = design(batch, iters=pre_iteration, soft=1.0, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, mask_ligand=mask_ligand, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+        batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = design(
+            batch, iters=pre_iteration, soft=1.0, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+            length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
+            con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
+            sequence_history=sequence_history, pre_run=pre_run, mask_ligand=mask_ligand, distogram_only=distogram_only,
+            predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain_letter, # use letter
+            increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+            non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
+            intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
+            num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+            fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+            variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+            fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+            binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+        )
     else:
         if design_algorithm == "3stages":
             print('-'*100)
             print(f"logits to softmax(T={e_soft})")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list1, traj_plddt_list1 = design(batch, iters=soft_iteration, e_soft=e_soft, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list1, traj_plddt_list1 = design(
+                batch, iters=soft_iteration, e_soft=e_soft, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8,
+                mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots,
+                loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history,
+                plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history,
+                pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales,
+                binder_chain=binder_chain_letter, increasing_contact_over_itr=increasing_contact_over_itr,
+                optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
+                inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
+                num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             print('-'*100)
             print("softmax(T=1) to softmax(T=0.01)")
             print('-'*100)
@@ -856,11 +1105,41 @@ def boltz_hallucination(
             new_logits = (alpha * batch["res_type_logits"]).clone().detach().requires_grad_(True)
             batch['res_type_logits'] = new_logits
             optimizer = torch.optim.SGD([batch['res_type_logits']], lr=learning_rate)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(batch, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8, e_num_optimizing_binder_pos=12,  mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(
+                batch, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8,
+                e_num_optimizing_binder_pos=12,  mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+                length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
+                con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
+                sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args,
+                loss_scales=loss_scales, binder_chain=binder_chain_letter,
+                increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+                non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
+                intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
+                num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             print('-'*100)
             print("hard")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list3, traj_plddt_list3 = design(batch, iters=hard_iteration, soft=1.0, hard = 1.0,temp=0.01, num_optimizing_binder_pos=12, e_num_optimizing_binder_pos=16, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list3, traj_plddt_list3 = design(
+                batch, iters=hard_iteration, soft=1.0, hard = 1.0,temp=0.01, num_optimizing_binder_pos=12,
+                e_num_optimizing_binder_pos=16, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+                length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
+                con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
+                sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args,
+                loss_scales=loss_scales, binder_chain=binder_chain_letter,
+                increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+                non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
+                intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
+                num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             traj_coords_list = traj_coords_list1 + traj_coords_list2 + traj_coords_list3 if save_trajectory else []
             traj_plddt_list = traj_plddt_list1 + traj_plddt_list2 + traj_plddt_list3 if save_trajectory else []
 
@@ -868,11 +1147,39 @@ def boltz_hallucination(
             print('-'*100)
             print(f"logits to softmax(T={e_soft_1})")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list1, traj_plddt_list1 = design(batch, iters=soft_iteration_1, e_soft=e_soft_1, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory) 
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list1, traj_plddt_list1 = design(
+                batch, iters=soft_iteration_1, e_soft=e_soft_1, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8,
+                mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots,
+                loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history,
+                plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history,
+                pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales,
+                binder_chain=binder_chain_letter, increasing_contact_over_itr=increasing_contact_over_itr,
+                optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
+                inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
+                num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             print('-'*100)
             print(f"logits to softmax(T={e_soft_2})")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(batch, iters=soft_iteration_2, e_soft=e_soft_2, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(
+                batch, iters=soft_iteration_2, e_soft=e_soft_2, num_optimizing_binder_pos=1, e_num_optimizing_binder_pos=8,
+                mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots,
+                loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history,
+                plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history,
+                pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales,
+                binder_chain=binder_chain_letter, increasing_contact_over_itr=increasing_contact_over_itr,
+                optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
+                inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
+                num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             print('-'*100)
             print("softmax(T=1) to softmax(T=0.01)")
             print('-'*100)
@@ -880,11 +1187,41 @@ def boltz_hallucination(
             new_logits = (alpha * batch["res_type_logits"]).clone().detach().requires_grad_(True)
             batch['res_type_logits'] = new_logits
             optimizer = torch.optim.SGD([batch['res_type_logits']], lr=learning_rate)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list3, traj_plddt_list3 = design(batch, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8, e_num_optimizing_binder_pos=12,  mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list3, traj_plddt_list3 = design(
+                batch, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8,
+                e_num_optimizing_binder_pos=12,  mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+                length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
+                con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
+                sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args,
+                loss_scales=loss_scales, binder_chain=binder_chain_letter,
+                increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+                non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
+                intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
+                num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
             print('-'*100)
             print("hard")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list4, traj_plddt_list4 = design(batch, iters=hard_iteration, soft=1.0, hard = 1.0,temp=0.01, num_optimizing_binder_pos=12, e_num_optimizing_binder_pos=16, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list4, traj_plddt_list4 = design(
+                batch, iters=hard_iteration, soft=1.0, hard = 1.0,temp=0.01, num_optimizing_binder_pos=12,
+                e_num_optimizing_binder_pos=16, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+                length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
+                con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
+                sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args,
+                loss_scales=loss_scales, binder_chain=binder_chain_letter,
+                increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos,
+                non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
+                intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
+                num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
 
             traj_coords_list = traj_coords_list1 + traj_coords_list2 + traj_coords_list3 + traj_coords_list4 if save_trajectory else []
             traj_plddt_list = traj_plddt_list1 + traj_plddt_list2 + traj_plddt_list3 + traj_plddt_list4 if save_trajectory else []
@@ -893,7 +1230,21 @@ def boltz_hallucination(
             print('-'*100)
             print("logits")
             print('-'*100)
-            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list= design(batch, iters=soft_iteration, soft = 0.0, e_soft=0.0, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
+            batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list= design(
+                batch, iters=soft_iteration, soft = 0.0, e_soft=0.0, mask=mask, chain_mask=chain_mask,
+                learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history,
+                i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history,
+                distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run,
+                distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales,
+                binder_chain=binder_chain_letter, increasing_contact_over_itr=increasing_contact_over_itr,
+                optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
+                inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
+                num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
+                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
+                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
+                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
+                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            )
 
     def _run_model(boltz_model, batch, predict_args):
         boltz_model.predict_args = predict_args
@@ -957,19 +1308,69 @@ def boltz_hallucination(
     "write_full_pde": False,
     }
 
-    def _mutate(sequence, best_logits, i_prob):
-        mutated_sequence = list(sequence) # Create a copy of the input tensor
-        i = np.random.choice(np.arange(length),p=i_prob/i_prob.sum())
-        i_logits = best_logits[:, i]
-        i_logits = i_logits - torch.max(i_logits)
-        i_X = i_logits- (torch.sum(torch.eye(i_logits.shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0)*(1e10)).to(device)
-        i_aa = torch.multinomial(torch.softmax(i_X, dim=-1), 1).item()
-        mutated_sequence[i] = alphabet[i_aa]
-        return ''.join(mutated_sequence)
+    # Actual _mutate function definition as per the plan
+    def _mutate(sequence_str, logits_on_binder, plddt_on_binder, variable_mask_1d_binder, binder_len, alphabet_list, tokens_list, device):
+        mutated_sequence_list = list(sequence_str)
 
-    best_logits = best_batch['res_type_logits']
-    best_seq = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
-    data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = best_seq
+        # Ensure plddt_on_binder is squeezed correctly and handles potential single-element tensor case
+        plddt_squeezed = plddt_on_binder.squeeze()
+        if plddt_squeezed.ndim == 0: # Handle case where binder_len might be 1
+            plddt_squeezed = plddt_squeezed.unsqueeze(0)
+
+        # Calculate mutation probabilities based on pLDDT for variable positions
+        i_prob_torch = torch.maximum(1.0 - plddt_squeezed, torch.tensor(0.0, device=device))
+        i_prob_torch[~variable_mask_1d_binder] = 0.0  # Zero out probability for fixed residues
+
+        sum_probs = torch.sum(i_prob_torch)
+
+        if sum_probs == 0:
+            # If all variable positions have pLDDT of 1.0 (or no variable positions), pick a random variable position
+            mutable_indices = torch.where(variable_mask_1d_binder)[0]
+            if len(mutable_indices) == 0:
+                return sequence_str # No mutable positions, return original sequence
+            # Select a random index from the mutable positions
+            i = mutable_indices[torch.randint(len(mutable_indices), (1,))].item()
+        else:
+            # Select a position to mutate based on inverse pLDDT probabilities
+            i = torch.multinomial(i_prob_torch / sum_probs, 1).item()
+
+        # Use logits for the chosen mutable position 'i'
+        i_logits_mut = logits_on_binder[i, :].clone() # Operate on a clone
+
+        # Exclude non-standard AAs, gap, pad, unknown, and potentially CYS from being sampled
+        # Pad=0, Gap=1, CYS=6 (often fixed or special handling), UNK=22, Nucleic=23-32
+        # Check global `tokens` list for exact indices if they differ.
+        excluded_token_indices = [tokens_list.index("<pad>"), tokens_list.index("-"), tokens_list.index("CYS")] + \
+                                 [tokens_list.index("UNK")] + \
+                                 [idx for idx, token_name in enumerate(tokens_list) if token_name in ["A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN"]]
+
+        for token_idx_to_exclude in excluded_token_indices:
+            if 0 <= token_idx_to_exclude < i_logits_mut.shape[0]: # Check boundary
+                i_logits_mut[token_idx_to_exclude] = -1e9 # Make it highly unlikely to be sampled
+
+        # Sample a new amino acid (token index) based on modified logits
+        sampled_token_idx = torch.multinomial(torch.softmax(i_logits_mut, dim=-1), 1).item()
+
+        # Convert sampled token index to 1-letter AA for the sequence string
+        # alphabet_list is 'XXARNDCQEGHILKMFPSTWYV-'
+        # tokens_list contains 3-letter codes for AAs. We need AA_3_TO_1
+        sampled_aa_3_letter = tokens_list[sampled_token_idx]
+        sampled_aa_1_letter = AA_3_TO_1.get(sampled_aa_3_letter, "X") # Default to X if not found in map (e.g. if UNK was sampled)
+
+        mutated_sequence_list[i] = sampled_aa_1_letter
+        return "".join(mutated_sequence_list)
+
+    # Ensure best_logits is binder-specific for _mutate call later
+    # It's better to use the current logits from the batch for mutation, or best_logits if it's truly the best from optimization.
+    # The plan implies using best_logits derived from the design phase.
+    # Let's assume best_batch contains the state from which we want to mutate.
+    # The variable 'best_logits' here will be used as 'logits_on_binder' for _mutate.
+    best_logits_for_mutate = best_batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+
+    # Update data with the sequence from the best_batch before starting semi-greedy.
+    # This ensures _update_batches uses the result of the design phase.
+    best_seq_from_design = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][0, binder_entity_mask_for_slicing,:], dim=-1).detach().cpu().numpy()])
+    data['sequences'][binder_chain_num_idx]['protein']['sequence'] = best_seq_from_design
 
     data_apo = copy.deepcopy(data)  # This handles all types of values correctly
     data_apo.pop('constraints', None)  # Remove constraints if they exist
@@ -997,12 +1398,21 @@ def boltz_hallucination(
         mutated_sequence_ls = []
         
         for t in range(10):
-            plddt = output['plddt'][best_batch['entity_id']==chain_to_number[binder_chain]]
-            i_prob = np.ones(length) if plddt is None else torch.maximum(1-plddt,torch.tensor(0))
-            i_prob = i_prob.detach().cpu().numpy() if torch.is_tensor(i_prob) else i_prob
-            sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
-            mutated_sequence = _mutate(sequence, best_logits, i_prob)
-            data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = mutated_sequence
+            # plddt_on_binder needs to be correctly sliced for the binder chain from the *current* output
+            plddt_on_binder = output['plddt'][0, binder_entity_mask_for_slicing]
+
+            # current_binder_seq_str needs to be derived correctly from the current batch state (output of _update_batches)
+            current_binder_seq_str = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][0, binder_entity_mask_for_slicing,:], dim=-1).detach().cpu().numpy()])
+
+            # Logits for mutation should be from the current batch state, or a refined 'best_logits_for_mutate' if it's being tracked
+            current_logits_for_mutate = best_batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+
+            # The old _mutate call was: _mutate(sequence, best_logits, i_prob)
+            # The new _mutate call from the plan:
+            mutated_sequence = _mutate(current_binder_seq_str, current_logits_for_mutate, plddt_on_binder, variable_mask_1d_binder, length, alphabet, tokens, device)
+
+            data['sequences'][binder_chain_num_idx]['protein']['sequence'] = mutated_sequence
+            # _update_batches will re-parse 'data' and give a new 'best_batch'
             best_batch, _, _, _ = _update_batches(data, data_apo)
             output = _run_model(boltz_model, best_batch, predict_args)
             

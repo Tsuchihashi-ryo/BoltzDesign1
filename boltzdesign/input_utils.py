@@ -9,6 +9,7 @@ import pandas as pd
 import pypdb
 from prody import *
 from rdkit import Chem
+from typing import Optional
 from rdkit.Chem import AllChem
 from Bio.PDB import PDBParser
 from boltz.data.msa.mmseqs2 import run_mmseqs2
@@ -235,9 +236,13 @@ def process_design_constraints(target_id_map: dict, modifications: str, modifica
     
     return constraints, modifications
     
-def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None) -> dict:
-    # Build chain dictionary
-    chain_dict = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
+def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None, chain_dict_to_populate: dict = None) -> dict:
+    # chain_dict_to_populate is pre-filled with binder information
+    # This function now adds target information to it.
+    if chain_dict_to_populate is None: # Should not happen if called from generate_yaml_for_target_binder
+        # Fallback, though generate_yaml_for_target_binder should always pass it.
+        chain_dict_to_populate = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
+
     # Map target types to their YAML representation
     type_map = {
         'protein': {'type': 'protein', 'sequence': True, 'msa': 'empty'},
@@ -263,12 +268,13 @@ def build_chain_dict(targets: list, target_type: str, binder_id: str, constraint
                 target_info[field] = target
             elif value:
                 target_info[field] = value
-                
-        chain_dict[target_id] = target_info
         
-    return chain_dict, yaml_target_ids
+        # Add to the provided dictionary
+        chain_dict_to_populate[target_id] = target_info
 
-def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False) -> dict:
+    return chain_dict_to_populate, yaml_target_ids
+
+def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, binder_native_sequence: Optional[str] = None) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
     
@@ -282,12 +288,26 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
         modifications (dict): Optional modifications to add to YAML
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
+        binder_native_sequence (Optional[str]): Native sequence of the binder, e.g., "CXXXXCXX"
         
     Returns:
         tuple: YAML content dictionary and output path
     """ 
+    chain_dict = {}
+    parsed_sequence = binder_native_sequence if binder_native_sequence else 'X' * 100
+    fixed_residues_list = []
+    if binder_native_sequence:
+        for i, aa in enumerate(binder_native_sequence):
+            if aa != 'X':
+                fixed_residues_list.append((aa, i))
 
-    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target)
+    chain_dict[binder_id] = {'type': 'protein', 'sequence': parsed_sequence}
+    if fixed_residues_list:
+        chain_dict[binder_id]['fixed_residues'] = fixed_residues_list
+
+    # Populate target chains
+    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target, chain_dict_to_populate=chain_dict)
+
     # Build sequences list for YAML
     sequences = []
     for chain_id, info in chain_dict.items():
@@ -326,6 +346,8 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
                     "msa": str(msa_path)
                 }
             }
+            if 'fixed_residues' in info: # Check if fixed_residues exists for this chain
+                entry["protein"]["fixed_residues"] = info['fixed_residues']
             
             if modifications and chain_id in yaml_target_ids and chain_id == modification_target:
                 entry["protein"]["modifications"] = modifications
