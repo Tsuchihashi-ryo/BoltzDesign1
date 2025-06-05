@@ -547,6 +547,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     chains: dict[str, ParsedChain] = {}
     chain_to_msa: dict[str, str] = {}
     entity_to_seq: dict[str, str] = {}
+    entity_to_fixed_residues_map: dict[int, list] = {}
+    all_fixed_residues: list[dict] = []
     is_msa_custom = False
     is_msa_auto = False
     for entity_id, items in enumerate(items_to_group.values()):
@@ -604,13 +606,26 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             unk_token = const.unk_token[entity_type.upper()]
 
             # Extract sequence
-            seq = items[0][entity_type]["sequence"]
-            entity_to_seq[entity_id] = seq
+            original_sequence_str = items[0][entity_type]["sequence"]
+            entity_to_seq[entity_id] = original_sequence_str
 
-            # Convert sequence to tokens
-            seq = [token_map.get(c, unk_token) for c in list(seq)]
+            fixed_residues_for_this_entity = []
+            processed_sequence_for_polymer_tokens = []
+            for res_idx, aa_char in enumerate(original_sequence_str):
+                if aa_char != 'X':
+                    if aa_char not in token_map:
+                        raise ValueError(f"Invalid amino acid character '{aa_char}' in sequence for entity {entity_id}")
+                    fixed_residues_for_this_entity.append({'res_idx': res_idx, 'aa': aa_char, 'token': token_map[aa_char]})
+                    processed_sequence_for_polymer_tokens.append(token_map[aa_char])
+                else:
+                    processed_sequence_for_polymer_tokens.append(unk_token)
+
+            entity_to_fixed_residues_map[entity_id] = fixed_residues_for_this_entity
+            seq = processed_sequence_for_polymer_tokens
 
             # Apply modifications
+            # This part might need adjustment if modifications can interact with 'X' residues
+            # For now, assuming modifications apply to the processed sequence tokens
             for mod in items[0][entity_type].get("modifications", []):
                 code = mod["ccd"]
                 idx = mod["position"] - 1  # 1-indexed
@@ -618,8 +633,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
             # Parse a polymer
             parsed_chain = parse_polymer(
-                sequence=seq,
-                entity=entity_id,
+                sequence=processed_sequence_for_polymer_tokens,
+                entity=str(entity_id), # parse_polymer expects entity to be a string
                 chain_type=chain_type,
                 components=ccd,
             )
@@ -716,6 +731,22 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     atom_idx_map = {}
 
     for asym_id, (chain_name, chain) in enumerate(chains.items()):
+        # Get the entity_id for this chain
+        entity_id = int(chain.entity)
+
+        # If this entity_id has fixed residue information, process it
+        if entity_id in entity_to_fixed_residues_map:
+            fixed_info_list = entity_to_fixed_residues_map[entity_id]
+            for info in fixed_info_list:
+                all_fixed_residues.append({
+                    'chain_id': chain_name,
+                    'chain_asym_id': asym_id,
+                    'entity_id': entity_id,
+                    'res_idx_in_entity': info['res_idx'],
+                    'aa': info['aa'],
+                    'token': info['token']
+                })
+
         # Compute number of atoms and residues
         res_num = len(chain.residues)
         atom_num = sum(len(res.atoms) for res in chain.residues)
@@ -875,8 +906,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         interfaces=[],
         inference_options=options,
     )
-    return Target(
+    target_obj = Target(
         record=record,
         structure=data,
         sequences=entity_to_seq,
     )
+    target_obj.fixed_residues = all_fixed_residues
+    return target_obj
