@@ -235,9 +235,15 @@ def process_design_constraints(target_id_map: dict, modifications: str, modifica
     
     return constraints, modifications
     
-def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None) -> dict:
+def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None, binder_fixed_sequence_info: Optional[list] = None, binder_sequence_length: Optional[int] = None) -> dict:
     # Build chain dictionary
-    chain_dict = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
+    if binder_sequence_length is not None:
+        binder_seq = 'X' * binder_sequence_length
+    else:
+        binder_seq = 'X' * 100
+    chain_dict = {binder_id: {'type': 'protein', 'sequence': binder_seq}}
+    if binder_fixed_sequence_info:
+        chain_dict[binder_id]['fixed_residues'] = binder_fixed_sequence_info
     # Map target types to their YAML representation
     type_map = {
         'protein': {'type': 'protein', 'sequence': True, 'msa': 'empty'},
@@ -268,7 +274,7 @@ def build_chain_dict(targets: list, target_type: str, binder_id: str, constraint
         
     return chain_dict, yaml_target_ids
 
-def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False) -> dict:
+def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, binder_fixed_sequence: Optional[str] = None) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
     
@@ -282,12 +288,24 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
         modifications (dict): Optional modifications to add to YAML
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
+        binder_fixed_sequence (Optional[str]): Optional fixed sequence for the binder. 'X' or 'x' for variable, other letters for fixed.
         
     Returns:
         tuple: YAML content dictionary and output path
     """ 
+    fixed_residues_info = None
+    binder_sequence_length = None
+    if binder_fixed_sequence:
+        fixed_residues_info = []
+        binder_sequence_length = len(binder_fixed_sequence)
+        for i, char in enumerate(binder_fixed_sequence):
+            if char.upper() != 'X':
+                fixed_residues_info.append({'index': i, 'residue': char.upper()})
+        if not fixed_residues_info: # Ensure it's None if no fixed residues, even if sequence is provided
+            fixed_residues_info = None
 
-    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target)
+
+    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target, binder_fixed_sequence_info=fixed_residues_info, binder_sequence_length=binder_sequence_length)
     # Build sequences list for YAML
     sequences = []
     for chain_id, info in chain_dict.items():
@@ -326,6 +344,8 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
                     "msa": str(msa_path)
                 }
             }
+            if 'fixed_residues' in info:
+                entry["protein"]["fixed_residues"] = info['fixed_residues']
             
             if modifications and chain_id in yaml_target_ids and chain_id == modification_target:
                 entry["protein"]["modifications"] = modifications

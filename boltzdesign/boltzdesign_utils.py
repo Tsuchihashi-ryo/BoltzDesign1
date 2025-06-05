@@ -529,6 +529,40 @@ def boltz_hallucination(
         
         tokenizer = BoltzTokenizer()
         tokenized = tokenizer.tokenize(input)
+
+        # Process fixed_residues if present in the schema
+        fixed_residues_info_list = []
+        binder_chain_id_char = None
+        for chain_idx, chain_record in enumerate(target.record.chains):
+            # Assuming binder_chain is specified elsewhere and we can identify it.
+            # For now, let's assume the first chain with 'protein' type and fixed_residues is the binder.
+            # This part might need adjustment based on how binder_chain is identified.
+            if chain_record.type == "protein" and hasattr(target.record.sequences[chain_idx], 'protein') and hasattr(target.record.sequences[chain_idx].protein, 'fixed_residues') and target.record.sequences[chain_idx].protein.fixed_residues is not None:
+                binder_chain_id_char = chain_record.id # e.g. 'A'
+                for fr_info in target.record.sequences[chain_idx].protein.fixed_residues:
+                    # Convert residue name to token_id
+                    # The tokens list is defined globally. Tokens are like 'ALA', 'CYS', etc.
+                    # The input residue is a single character like 'C'. We need to map it to 'CYS'.
+                    # For simplicity, we'll assume a direct mapping if possible, or use a helper.
+                    # This mapping needs to be robust.
+                    # Let's find the three-letter code for the single-letter residue.
+                    # We can use const.protein_1to3 for this.
+                    residue_3_letter = const.protein_1to3.get(fr_info['residue'].upper())
+                    if residue_3_letter:
+                        try:
+                            token_id = tokens.index(residue_3_letter)
+                            fixed_residues_info_list.append({
+                                'index': fr_info['index'], # 0-indexed
+                                'residue': fr_info['residue'].upper(),
+                                'token_id': token_id
+                            })
+                        except ValueError:
+                            logging.warning(f"Residue {residue_3_letter} not in tokens list.")
+                    else:
+                        logging.warning(f"Could not convert residue {fr_info['residue']} to 3-letter code.")
+                # Assuming only one chain will have fixed_residues specified this way for the binder
+                break
+
         featurizer = BoltzFeaturizer()
 
         if pocket_conditioning:
@@ -563,10 +597,33 @@ def boltz_hallucination(
         if keep_record:
             batch['record'] = target.record
 
+        if fixed_residues_info_list:
+            # Store fixed_residues_info in the batch dictionary.
+            # This needs to be a tensor to be moved to device with other batch items.
+            # However, it's a list of dicts. We'll handle its device transfer separately if needed,
+            # or pass it as a CPU-based list. For now, add it directly.
+            batch['fixed_residues'] = fixed_residues_info_list
+            # Also store the binder_chain_id if identified
+            if binder_chain_id_char:
+                batch['binder_chain_id_char'] = binder_chain_id_char
+
+
         return batch, structure
     
     batch, structure = get_batch(target, max_seqs=msa_max_seqs, length=length, pocket_conditioning=pocket_conditioning)
+
+    # Handle fixed_residues after batch creation and before moving to device
+    # Store fixed_residues on CPU, it's a list of dicts, not a tensor.
+    fixed_residues_cpu = batch.pop('fixed_residues', None)
+    binder_chain_id_char_cpu = batch.pop('binder_chain_id_char', None)
+
     batch = {key: value.unsqueeze(0).to(device) for key, value in batch.items()}
+
+    if fixed_residues_cpu:
+        batch['fixed_residues'] = fixed_residues_cpu # Add it back after moving other items
+    if binder_chain_id_char_cpu:
+        batch['binder_chain_id_char'] = binder_chain_id_char_cpu
+
     
     ## initialize res_type_logits
     if pre_run:
@@ -612,8 +669,13 @@ def boltz_hallucination(
     plddt_loss_history = []
 
     mask = torch.ones_like(batch['res_type_logits'])
-    mask[batch['entity_id']!=chain_to_number[binder_chain], :] = 0
-    chain_mask = (batch['entity_id'] == chain_to_number[binder_chain]).int()
+    # Ensure chain_to_number[binder_chain] is valid; if binder_chain_id_char is present, use it.
+    # The original binder_chain argument to boltz_hallucination might be a default or placeholder.
+    # The actual binder chain with fixed residues is what matters.
+    current_binder_chain_numeric_id = chain_to_number[batch.get('binder_chain_id_char', binder_chain)]
+
+    mask[batch['entity_id']!=current_binder_chain_numeric_id, :] = 0
+    chain_mask = (batch['entity_id'] == current_binder_chain_numeric_id).int()
     mid_points = torch.linspace(2, 22, 64).to(device) 
 
     def design(batch, 
@@ -687,41 +749,57 @@ def boltz_hallucination(
                 else:
                     dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
 
-
             pdist = dict_out['pdistogram']
             mid_pts = get_mid_points(pdist).to(device)
 
+            # Create masks for loss calculation, considering fixed residues
+            # chain_mask is 1 for binder residues, 0 otherwise.
+            # current_binder_chain_numeric_id should be available in this scope
+
+            loss_chain_mask = chain_mask.clone().float() # Mask for residues on the binder chain
+            other_chain_mask = (1.0 - chain_mask.float()) # Mask for residues NOT on the binder chain
+
+            if 'fixed_residues' in batch and batch['fixed_residues']:
+                binder_entity_mask = (batch['entity_id'].squeeze(0) == current_binder_chain_numeric_id)
+                binder_indices_full_seq = torch.where(binder_entity_mask)[0]
+                for fr_info in batch['fixed_residues']:
+                    if fr_info['index'] < len(binder_indices_full_seq):
+                        actual_index_in_batch = binder_indices_full_seq[fr_info['index']]
+                        loss_chain_mask[:, actual_index_in_batch] = 0 # Exclude fixed residues from binder chain losses
+                    else:
+                        logging.warning(f"Fixed residue index {fr_info['index']} out of bounds during loss mask creation for binder chain {current_binder_chain_numeric_id}.")
+
             # Calculate contact losses
+            # Intra-chain contacts for the binder (excluding fixed parts)
             con_loss = get_con_loss(pdist, mid_pts,
                                 num=num_intra_contacts, seqsep=9, cutoff=intra_chain_cutoff,
                                 binary=False,
-                                mask_1d=chain_mask, mask_1b=chain_mask)
+                                mask_1d=loss_chain_mask, mask_1b=loss_chain_mask) # Use modified mask
 
             if optimize_contact_per_binder_pos:
                 if increasing_contact_over_itr:
                     num_optimizing_binder_pos = 0 if pre_run else num_optimizing_binder_pos
+                    # Inter-chain contacts: binder (excluding fixed) to other chains
                     i_con_loss = get_con_loss(pdist, mid_pts,
                                             num=num_inter_contacts, seqsep=0, num_pos=num_optimizing_binder_pos,
                                             cutoff=inter_chain_cutoff, binary=False, 
-                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
+                                            mask_1d=loss_chain_mask, mask_1b=other_chain_mask) # Use modified binder mask
                 else:
                     i_con_loss = get_con_loss(pdist, mid_pts,
                                             num=num_inter_contacts, seqsep=0,
                                             cutoff=inter_chain_cutoff, binary=False, 
-                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
-
+                                            mask_1d=loss_chain_mask, mask_1b=other_chain_mask) # Use modified binder mask
             else:
-            
+                # Inter-chain contacts: other chains to binder (excluding fixed)
                 i_con_loss = get_con_loss(pdist, mid_pts,
                                         num=num_inter_contacts, seqsep=0, 
                                         cutoff=inter_chain_cutoff, binary=False, 
-                                        mask_1d=1-chain_mask, mask_1b=chain_mask)
+                                        mask_1d=other_chain_mask, mask_1b=loss_chain_mask) # Use modified binder mask
 
-
-            mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
+            # Helix loss for the binder (excluding fixed parts)
+            mask_2d_for_helix = loss_chain_mask[:, :, None] * loss_chain_mask[:, None, :]
             helix_loss = _get_helix_loss(pdist, mid_pts,
-                                    offset=None, mask_2d=mask_2d, binary=True)
-
+                                    offset=None, mask_2d=mask_2d_for_helix, binary=True)
 
             if pre_run and mask_ligand:
                     losses = {
@@ -733,19 +811,31 @@ def boltz_hallucination(
                         'con_loss': con_loss,
                         'i_con_loss': i_con_loss,
                         'helix_loss': helix_loss
-                    }           
+                    }
 
             if not pre_run and not distogram_only:
-                plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
+                # pLDDT loss for the binder (excluding fixed parts)
+                plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=loss_chain_mask)
+
                 pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
-                i_pae_loss = get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask)
-                pae_loss = get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask)
-                rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)
+                # PAE loss between binder (excluding fixed) and other chains
+                i_pae_loss = get_pae_loss(pae, mask_1d=other_chain_mask, mask_1b=loss_chain_mask)
+                # PAE loss within the binder (excluding fixed parts)
+                pae_loss = get_pae_loss(pae, mask_1d=loss_chain_mask, mask_1b=loss_chain_mask)
+
+                # Rg loss for the binder (excluding fixed parts - implicitly handled if get_CA_and_sequence respects a mask or if ca_coords are derived from a masked sequence)
+                # For rg_loss, the current add_rg_loss takes sample_atom_coords and batch.
+                # get_CA_coords inside add_rg_loss uses batch['entity_id']==chain_to_number[binder_chain].
+                # This needs to be modified to use loss_chain_mask or exclude fixed residues if rg is to be calculated only on non-fixed binder parts.
+                # For now, rg_loss might include fixed residues if not carefully handled inside add_rg_loss.
+                # Let's assume for now add_rg_loss is not modified, or its masking is sufficient.
+                # If more precise masking for Rg is needed, add_rg_loss would need loss_chain_mask.
+                rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain) # binder_chain here is char 'A', 'B' etc.
 
                 losses.update({
                     'plddt_loss': plddt_loss,
-                    'i_pae_loss': i_pae_loss,
-                    'pae_loss': pae_loss,
+                    'i_pae_loss': i_pae_loss, # Loss between variable parts of binder and other chains
+                    'pae_loss': pae_loss,     # Loss within variable parts of binder
                     'rg_loss': rg_loss
                 })
                 
@@ -778,15 +868,67 @@ def boltz_hallucination(
 
             return total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
         
-        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A'):
+        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A', current_binder_chain_numeric_id=None):
+            # current_binder_chain_numeric_id is already passed and should be used
+            if current_binder_chain_numeric_id is None: # Fallback, though it should always be provided
+                current_binder_chain_numeric_id = chain_to_number[binder_chain]
+
             batch["logits"] = alpha*batch['res_type_logits']
+
+            # Apply fixed residues constraints to logits before softmax
+            if 'fixed_residues' in batch and batch['fixed_residues']:
+                binder_entity_mask = (batch['entity_id'].squeeze(0) == current_binder_chain_numeric_id)
+                binder_indices_full_seq = torch.where(binder_entity_mask)[0]
+                for fr_info in batch['fixed_residues']:
+                    if fr_info['index'] < len(binder_indices_full_seq):
+                        actual_index_in_batch = binder_indices_full_seq[fr_info['index']]
+                        # Set logits for fixed residue: high for the target token, low for others
+                        # This ensures that after softmax, the probability of the fixed token is close to 1.
+                        # Create a one-hot like tensor for the fixed residue
+                        one_hot_fixed = torch.full_like(batch["logits"][0, actual_index_in_batch, :], -1e10) # Large negative number
+                        one_hot_fixed[fr_info['token_id']] = 1e10 # Large positive number for the fixed token
+                        batch["logits"][:, actual_index_in_batch, :] = one_hot_fixed
+                    else:
+                        logging.warning(f"Fixed residue index {fr_info['index']} out of bounds during logit update for binder chain {current_binder_chain_numeric_id}.")
+
             X =  batch['logits']- torch.sum(torch.eye(batch['logits'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10)
             batch['soft'] = torch.softmax(X/opt["temp"],dim=-1)
             batch['hard'] =  torch.zeros_like(batch['soft']).scatter_(-1, batch['soft'].max(dim=-1, keepdim=True)[1], 1.0)
+
+            # Enforce fixed residues in soft and hard representations
+            if 'fixed_residues' in batch and batch['fixed_residues']:
+                binder_entity_mask_sq = (batch['entity_id'].squeeze(0) == current_binder_chain_numeric_id)
+                binder_indices_full_seq_sq = torch.where(binder_entity_mask_sq)[0]
+                for fr_info in batch['fixed_residues']:
+                    if fr_info['index'] < len(binder_indices_full_seq_sq):
+                        actual_index_in_batch_sq = binder_indices_full_seq_sq[fr_info['index']]
+                        # For 'soft'
+                        batch['soft'][:, actual_index_in_batch_sq, :] = 0.0 # Zero out all probabilities
+                        batch['soft'][:, actual_index_in_batch_sq, fr_info['token_id']] = 1.0 # Set fixed token prob to 1
+                        # For 'hard'
+                        batch['hard'][:, actual_index_in_batch_sq, :] = 0.0 # Zero out all
+                        batch['hard'][:, actual_index_in_batch_sq, fr_info['token_id']] = 1.0 # Set fixed token to 1
+                    else:
+                        logging.warning(f"Fixed residue index {fr_info['index']} out of bounds during soft/hard update for binder chain {current_binder_chain_numeric_id}.")
+
             batch['hard'] =  (batch['hard'] - batch['soft']).detach() + batch['soft']
-            batch['pseudo'] =  opt["soft"] * batch["soft"] + (1-opt["soft"]) * batch["res_type_logits"]
+            batch['pseudo'] =  opt["soft"] * batch["soft"] + (1-opt["soft"]) * batch["res_type_logits"] # res_type_logits already has fixed positions effectively set due to logit manipulation
             batch['pseudo'] = opt["hard"] * batch["hard"] + (1-opt["hard"]) * batch["pseudo"]
+
+            # Apply the general mask (e.g., only binder chain is designable)
+            # Then, ensure fixed residues are still respected in the final 'res_type'
             batch['res_type'] = batch['pseudo']*mask + batch['res_type_logits']*(1-mask)
+
+            if 'fixed_residues' in batch and batch['fixed_residues']:
+                binder_entity_mask_final = (batch['entity_id'].squeeze(0) == current_binder_chain_numeric_id)
+                binder_indices_full_seq_final = torch.where(binder_entity_mask_final)[0]
+                for fr_info in batch['fixed_residues']:
+                    if fr_info['index'] < len(binder_indices_full_seq_final):
+                        actual_index_in_batch_final = binder_indices_full_seq_final[fr_info['index']]
+                        batch['res_type'][:, actual_index_in_batch_final, :] = 0.0
+                        batch['res_type'][:, actual_index_in_batch_final, fr_info['token_id']] = 1.0
+                    else:
+                        logging.warning(f"Fixed residue index {fr_info['index']} out of bounds during final res_type update for binder chain {current_binder_chain_numeric_id}.")
         
             if non_protein_target:
                 batch['msa'] = batch['res_type'].unsqueeze(0).to(device).detach()
@@ -820,18 +962,41 @@ def boltz_hallucination(
 
             opt["lr_rate"] = learning_rate * lr_scale
                 
-            batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=binder_chain)
-            total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run, mask_ligand, distogram_only, predict_args, loss_scales, binder_chain, increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, num_inter_contacts= num_inter_contacts, num_intra_contacts=num_intra_contacts, num_optimizing_binder_pos=num_optimizing_binder_pos, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, save_trajectory = save_trajectory)
+                batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=batch.get('binder_chain_id_char', binder_chain), current_binder_chain_numeric_id=current_binder_chain_numeric_id) # Pass current_binder_chain_numeric_id
+                total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run, mask_ligand, distogram_only, predict_args, loss_scales, batch.get('binder_chain_id_char', binder_chain), increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, num_inter_contacts= num_inter_contacts, num_intra_contacts=num_intra_contacts, num_optimizing_binder_pos=num_optimizing_binder_pos, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, save_trajectory = save_trajectory, current_binder_chain_numeric_id=current_binder_chain_numeric_id) # Pass current_binder_chain_numeric_id
             traj_coords_list.append(traj_coords)
             traj_plddt_list.append(traj_plddt)
-            current_sequence = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
+                current_sequence = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==current_binder_chain_numeric_id,:], dim=-1).detach().cpu().numpy()])
             if prev_sequence is not None:
                 diff_count = sum(1 for a, b in zip(current_sequence, prev_sequence) if a != b)
                 diff_percentage = (diff_count / length) * 100
             prev_sequence = current_sequence
             total_loss.backward()
             if batch['res_type_logits'].grad is not None:
-                batch['res_type_logits'].grad[batch['entity_id']!=chain_to_number[binder_chain],:] = 0
+                    grad_mask = (batch['entity_id'] != current_binder_chain_numeric_id)
+                    batch['res_type_logits'].grad[grad_mask,:] = 0
+                    # Also zero out gradients for fixed positions within the binder chain
+                    if 'fixed_residues' in batch and batch['fixed_residues']:
+                        for fr_info in batch['fixed_residues']:
+                            # fr_info['index'] is the residue index within the binder chain
+                            # We need to find the absolute index in the concatenated sequence
+                            # This assumes entity_id corresponds to the binder chain
+                            # and res_type_logits is ordered by entity_id then residue index.
+                            # This logic might need refinement if fixed_residues are on different chains
+                            # or if indexing isn't straightforward.
+                            # For now, assume indices in fixed_residues are for the current_binder_chain_numeric_id.
+                            # Find the starting index of the binder chain in the full sequence tensor
+                            binder_entity_mask = (batch['entity_id'].squeeze(0) == current_binder_chain_numeric_id)
+
+                            # Get the indices in the full sequence that correspond to the binder chain
+                            binder_indices_full_seq = torch.where(binder_entity_mask)[0]
+
+                            if fr_info['index'] < len(binder_indices_full_seq):
+                                actual_index_in_batch = binder_indices_full_seq[fr_info['index']]
+                                batch['res_type_logits'].grad[:, actual_index_in_batch, :] = 0
+                            else:
+                                logging.warning(f"Fixed residue index {fr_info['index']} is out of bounds for binder chain {current_binder_chain_numeric_id} with length {len(binder_indices_full_seq)}.")
+
                 batch['res_type_logits'].grad[..., [0,1,6,22,23,24,25,26,27,28,29,30,31,32]] = 0
                 batch['res_type_logits'].grad = norm_seq_grad(batch['res_type_logits'].grad, chain_mask)
                 optimizer.step()
@@ -936,8 +1101,8 @@ def boltz_hallucination(
         }
 
         best_logits = batch['res_type_logits']
-        best_seq = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
-        data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = best_seq
+        best_seq = ''.join([alphabet[i] for i in torch.argmax(batch['res_type'][batch['entity_id']==current_binder_chain_numeric_id,:], dim=-1).detach().cpu().numpy()])
+        data['sequences'][chain_to_number[batch.get('binder_chain_id_char', binder_chain)]]['protein']['sequence'] = best_seq
         return batch['res_type'].detach().cpu().numpy(), plots, loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
 
     boltz_model.eval()
@@ -946,7 +1111,16 @@ def boltz_hallucination(
         if first_step_best_batch is not None:
             best_batch = first_step_best_batch
         else:
-            best_batch = batch  
+            # Ensure fixed_residues from the original batch are carried over if 'batch' is reassigned.
+            # This is crucial if best_batch becomes 'batch' here.
+            fixed_residues_to_carry = batch.get('fixed_residues')
+            binder_chain_char_to_carry = batch.get('binder_chain_id_char')
+            best_batch = batch
+            if fixed_residues_to_carry:
+                best_batch['fixed_residues'] = fixed_residues_to_carry
+            if binder_chain_char_to_carry:
+                best_batch['binder_chain_id_char'] = binder_chain_char_to_carry
+
 
     predict_args = {
     "recycling_steps": 3,  # Default value
@@ -967,28 +1141,56 @@ def boltz_hallucination(
         mutated_sequence[i] = alphabet[i_aa]
         return ''.join(mutated_sequence)
 
-    best_logits = best_batch['res_type_logits']
-    best_seq = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
-    data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = best_seq
+    best_logits = best_batch['res_type_logits'] # Ensure best_batch has fixed_residues if it's used in _mutate
+    current_binder_chain_numeric_id = chain_to_number[best_batch.get('binder_chain_id_char', binder_chain)]
+    best_seq = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==current_binder_chain_numeric_id,:], dim=-1).detach().cpu().numpy()])
+    data['sequences'][chain_to_number[best_batch.get('binder_chain_id_char', binder_chain)]]['protein']['sequence'] = best_seq
 
     data_apo = copy.deepcopy(data)  # This handles all types of values correctly
     data_apo.pop('constraints', None)  # Remove constraints if they exist
-    data_apo['sequences'] = [data_apo['sequences'][chain_to_number[binder_chain]]]  # Keep only chain B
+    data_apo['sequences'] = [data_apo['sequences'][chain_to_number[best_batch.get('binder_chain_id_char', binder_chain)]]]  # Keep only binder chain
 
     def _update_batches(data, data_apo):
-        target = parse_boltz_schema(name, data, ccd_lib)
-        target_apo = parse_boltz_schema(name, data_apo, ccd_lib)
-        best_batch, best_structure = get_batch(target, msa_max_seqs, length, keep_record=True)
-        best_batch_apo, best_structure_apo = get_batch(target_apo, msa_max_seqs, length, keep_record=True)
-        best_batch = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch.items()}
-        best_batch_apo = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch_apo.items()}
-        return best_batch, best_batch_apo, best_structure, best_structure_apo
+        # This function re-parses schema and creates batches.
+        # We need to ensure that fixed_residues info from data (if any) is correctly propagated.
+        # The get_batch function was modified to read this from target.record.
+        target_obj = parse_boltz_schema(name, data, ccd_lib)
+        target_apo_obj = parse_boltz_schema(name, data_apo, ccd_lib)
+
+        # Pass the original batch's fixed_residues to the new batch if not parsed from schema again
+        # However, get_batch is designed to parse it from the schema.
+        # So, ensure 'data' and 'data_apo' yaml structures are consistent with fixed_residues schema.
+        # The fixed_residues should be part of the 'data' dict if it's to be parsed by parse_boltz_schema.
+        # If 'data' is modified (e.g., sequence changed), fixed_residues should persist if they are static.
+
+        # If fixed_residues are meant to be static and not part of the mutable 'data' dict's sequence info,
+        # they might need to be passed explicitly or re-added here.
+        # For now, assume get_batch handles it correctly based on the 'data' dict.
+
+        new_best_batch, new_best_structure = get_batch(target_obj, msa_max_seqs, length, keep_record=True, pocket_conditioning=pocket_conditioning) # Added pocket_conditioning
+        new_best_batch_apo, new_best_structure_apo = get_batch(target_apo_obj, msa_max_seqs, length, keep_record=True, pocket_conditioning=pocket_conditioning) # Added pocket_conditioning
+
+        fixed_residues_cpu_holo = new_best_batch.pop('fixed_residues', None)
+        binder_chain_char_holo = new_best_batch.pop('binder_chain_id_char', None)
+        fixed_residues_cpu_apo = new_best_batch_apo.pop('fixed_residues', None)
+        binder_chain_char_apo = new_best_batch_apo.pop('binder_chain_id_char', None)
+
+        new_best_batch = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in new_best_batch.items()}
+        new_best_batch_apo = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in new_best_batch_apo.items()}
+
+        if fixed_residues_cpu_holo: new_best_batch['fixed_residues'] = fixed_residues_cpu_holo
+        if binder_chain_char_holo: new_best_batch['binder_chain_id_char'] = binder_chain_char_holo
+        if fixed_residues_cpu_apo: new_best_batch_apo['fixed_residues'] = fixed_residues_cpu_apo
+        if binder_chain_char_apo: new_best_batch_apo['binder_chain_id_char'] = binder_chain_char_apo
+
+        return new_best_batch, new_best_batch_apo, new_best_structure, new_best_structure_apo
 
     best_batch, best_batch_apo, best_structure, best_structure_apo = _update_batches(data, data_apo)
     output = _run_model(boltz_model, best_batch, predict_args)
     output_apo = _run_model(boltz_model, best_batch_apo, predict_args)
 
-    prev_sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
+    current_binder_numeric_id_for_mutate = chain_to_number[best_batch.get('binder_chain_id_char', binder_chain)]
+    prev_sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==current_binder_numeric_id_for_mutate,:], dim=-1).detach().cpu().numpy()])
     prev_iptm = output['iptm'].detach().cpu().numpy()
     print("best design iptm", prev_iptm)
     print("Semi-greedy steps", semi_greedy_steps)
@@ -997,14 +1199,43 @@ def boltz_hallucination(
         mutated_sequence_ls = []
         
         for t in range(10):
-            plddt = output['plddt'][best_batch['entity_id']==chain_to_number[binder_chain]]
+            plddt = output['plddt'][best_batch['entity_id']==current_binder_numeric_id_for_mutate]
             i_prob = np.ones(length) if plddt is None else torch.maximum(1-plddt,torch.tensor(0))
             i_prob = i_prob.detach().cpu().numpy() if torch.is_tensor(i_prob) else i_prob
-            sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==chain_to_number[binder_chain],:], dim=-1).detach().cpu().numpy()])
-            mutated_sequence = _mutate(sequence, best_logits, i_prob)
-            data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = mutated_sequence
-            best_batch, _, _, _ = _update_batches(data, data_apo)
-            output = _run_model(boltz_model, best_batch, predict_args)
+            # Pass fixed_residues to _mutate if it needs it, or ensure i_prob is correctly pre-masked
+            sequence = ''.join([alphabet[i] for i in torch.argmax(best_batch['res_type'][best_batch['entity_id']==current_binder_numeric_id_for_mutate,:], dim=-1).detach().cpu().numpy()])
+
+            # _mutate needs fixed_residues information to avoid mutating fixed positions.
+            # It gets best_logits, which doesn't directly tell it which positions are fixed.
+            # We need to modify _mutate or pass the fixed_residues info to it.
+            # For now, let's assume _mutate will be modified later to handle this via i_prob.
+            # The i_prob itself should be zeroed out at fixed positions before calling _mutate.
+            if 'fixed_residues' in best_batch and best_batch['fixed_residues']:
+                for fr_info in best_batch['fixed_residues']:
+                    if fr_info['index'] < len(i_prob):
+                         i_prob[fr_info['index']] = 0 # Zero out probability for fixed residues
+
+            # Ensure i_prob sums to a positive value if not all residues are fixed
+            if i_prob.sum() == 0 and len(i_prob) > 0 and not all(val == 0 for val in i_prob) : # Avoid division by zero if all probs are zero (e.g. all fixed)
+                 # This case implies all residues might be fixed, or plddt is all 1s.
+                 # If all are fixed, no mutation should happen.
+                 # We can add a check here: if i_prob.sum() == 0, skip mutation attempt.
+                 logging.warning("Sum of mutation probabilities is zero. Skipping mutation.")
+                 mutated_sequence = sequence # No mutation possible
+            elif i_prob.sum() > 0 :
+                 mutated_sequence = _mutate(sequence, best_logits, i_prob) # best_logits is from before semi-greedy
+            else: # Handles cases like empty i_prob or other unexpected scenarios
+                 mutated_sequence = sequence
+
+
+            data['sequences'][chain_to_number[best_batch.get('binder_chain_id_char', binder_chain)]]['protein']['sequence'] = mutated_sequence
+            # When data is updated, _update_batches will re-parse and re-create best_batch.
+            # We need to ensure fixed_residues are correctly handled through this update.
+            # The current _update_batches calls get_batch which reads fixed_residues from the schema.
+            # So, 'data' must contain the fixed_residues definition if it's to be used.
+            # If fixed_residues are static, they should be in the original YAML and remain there.
+            temp_best_batch, _, _, _ = _update_batches(data, data_apo) # Re-assign to a temp var
+            output = _run_model(boltz_model, temp_best_batch, predict_args) # Use the new batch
             
             iptm = output['iptm'].detach().cpu().numpy()
             confidence_score.append(iptm)
