@@ -910,6 +910,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         record=record,
         structure=data,
         sequences=entity_to_seq,
+        fixed_residues=all_fixed_residues
     )
-    target_obj.fixed_residues = all_fixed_residues
     return target_obj

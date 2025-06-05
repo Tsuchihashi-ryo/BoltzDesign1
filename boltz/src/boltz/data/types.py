@@ -1,7 +1,7 @@
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, List, Dict, Any
 
 import numpy as np
 from mashumaro.mixins.dict import DataClassDictMixin
@@ -393,6 +393,7 @@ class Target:
     record: Record
     structure: Structure
     sequences: Optional[dict[str, str]] = None
+    fixed_residues: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)
