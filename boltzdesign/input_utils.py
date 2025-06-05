@@ -235,9 +235,16 @@ def process_design_constraints(target_id_map: dict, modifications: str, modifica
     
     return constraints, modifications
     
-def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None) -> dict:
+def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None, binder_sequence_template: str = None, default_binder_length: int = 100) -> dict:
     # Build chain dictionary
-    chain_dict = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
+    if binder_sequence_template and binder_sequence_template.strip():
+        binder_seq_to_use = binder_sequence_template.strip()
+        # logger.info(f"Using provided binder sequence template: {binder_seq_to_use}")
+    else:
+        binder_seq_to_use = 'X' * default_binder_length
+        # logger.info(f"No binder template, using default length {default_binder_length}: {binder_seq_to_use}")
+
+    chain_dict = {binder_id: {'type': 'protein', 'sequence': binder_seq_to_use}}
     # Map target types to their YAML representation
     type_map = {
         'protein': {'type': 'protein', 'sequence': True, 'msa': 'empty'},
@@ -268,7 +275,7 @@ def build_chain_dict(targets: list, target_type: str, binder_id: str, constraint
         
     return chain_dict, yaml_target_ids
 
-def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False) -> dict:
+def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, binder_sequence_template: str = None, default_binder_length: int = 100) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
     
@@ -282,12 +289,23 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
         modifications (dict): Optional modifications to add to YAML
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
+        binder_sequence_template (str): Optional sequence template for the binder (e.g., "XXXACDEFXXX").
+        default_binder_length (int): Default length for binder if no template is provided.
         
     Returns:
         tuple: YAML content dictionary and output path
     """ 
 
-    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target)
+    chain_dict, yaml_target_ids = build_chain_dict(
+        targets,
+        target_type,
+        binder_id,
+        constraints,
+        modifications,
+        modification_target,
+        binder_sequence_template=binder_sequence_template,
+        default_binder_length=default_binder_length
+    )
     # Build sequences list for YAML
     sequences = []
     for chain_id, info in chain_dict.items():
