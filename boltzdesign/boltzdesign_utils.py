@@ -1383,6 +1383,47 @@ def boltz_hallucination(
         best_batch_apo, best_structure_apo = get_batch(target_apo, msa_max_seqs, length, keep_record=True)
         best_batch = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch.items()}
         best_batch_apo = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch_apo.items()}
+
+    # Initialize res_type_logits for best_batch
+    if 'res_type' in best_batch:
+        best_batch['res_type_logits'] = best_batch['res_type'].clone().detach().to(device).float()
+    else:
+        # This case should ideally not be reached if get_batch functions as expected.
+        logging.warning("'res_type' not found in best_batch within _update_batches. This might lead to issues.")
+
+    # Apply fixed residues to best_batch['res_type_logits']
+    # This relies on 'res_type_logits' being successfully initialized above.
+    # Variables like fixed_residues_info_1_letter, fixed_aa_tokens, fixed_binder_positions,
+    # binder_chain_num_idx, and device are accessible from the outer scope of boltz_hallucination.
+    if 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and fixed_aa_tokens.numel() > 0 and fixed_binder_positions.numel() > 0:
+        current_binder_entity_mask_for_slicing = (best_batch['entity_id'] == binder_chain_num_idx).squeeze(0)
+
+        if torch.any(current_binder_entity_mask_for_slicing):
+            # Ensure the slice exists and is not empty
+            binder_logits_slice = best_batch['res_type_logits'][0, current_binder_entity_mask_for_slicing, :]
+            if binder_logits_slice.numel() > 0:
+                # Ensure fixed_binder_positions are valid for the current slice length
+                if binder_logits_slice.shape[0] > torch.max(fixed_binder_positions):
+                    binder_logits_slice[fixed_binder_positions, :] = -1e9
+                    binder_logits_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
+                else:
+                    logging.warning(f"fixed_binder_positions (max: {torch.max(fixed_binder_positions)}) are out of bounds for the current binder slice length ({binder_logits_slice.shape[0]}) in _update_batches.")
+            else:
+                logging.warning(f"Binder slice is empty for chain {binder_chain_num_idx} in best_batch['entity_id'] within _update_batches when applying fixed residues.")
+        else:
+            logging.warning(f"Binder chain {binder_chain_num_idx} not found in best_batch['entity_id'] within _update_batches when applying fixed residues.")
+    elif 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and (fixed_aa_tokens.numel() == 0 or fixed_binder_positions.numel() == 0) and len(fixed_residues_info_1_letter) > 0:
+        # This case means fixed_residues_info_1_letter was provided, but it resulted in empty fixed_aa_tokens/fixed_binder_positions
+        # (e.g. all specified fixed residues were invalid). Log a warning.
+        logging.warning("fixed_residues_info_1_letter was provided but resulted in no valid fixed tokens/positions to apply in _update_batches.")
+
+
+    # Initialize res_type_logits for best_batch_apo for consistency
+    if 'res_type' in best_batch_apo:
+        best_batch_apo['res_type_logits'] = best_batch_apo['res_type'].clone().detach().to(device).float()
+    else:
+        logging.warning("'res_type' not found in best_batch_apo within _update_batches.")
+
         return best_batch, best_batch_apo, best_structure, best_structure_apo
 
     best_batch, best_batch_apo, best_structure, best_structure_apo = _update_batches(data, data_apo)
