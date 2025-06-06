@@ -299,7 +299,7 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
     if binder_native_sequence:
         for i, aa in enumerate(binder_native_sequence):
             if aa != 'X':
-                fixed_residues_list.append((aa, i))
+                fixed_residues_list.append([aa, i])
 
     chain_dict[binder_id] = {'type': 'protein', 'sequence': parsed_sequence}
     if fixed_residues_list:
