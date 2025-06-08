@@ -540,6 +540,7 @@ def boltz_hallucination(
 
     with yaml_path.open("r") as file:
         data = yaml.safe_load(file)
+        
 
     # Parameter Handling & Initialization for fixed residues
     binder_chain_letter = binder_chain
@@ -636,6 +637,7 @@ def boltz_hallucination(
 
     # Batch Initialization & Fixed Residue Application
     binder_entity_mask_for_slicing = (batch['entity_id'] == binder_chain_num_idx).squeeze(0) # Used for slicing binder parts
+    
 
     if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
         # Ensure res_type and res_type_logits are float for modification
@@ -719,6 +721,7 @@ def boltz_hallucination(
     mask[batch['entity_id']!=chain_to_number[binder_chain], :] = 0
     chain_mask = (batch['entity_id'] == chain_to_number[binder_chain]).int()
     mid_points = torch.linspace(2, 22, 64).to(device) 
+    
 
     def design(batch, 
                iters = None,
@@ -760,7 +763,8 @@ def boltz_hallucination(
                 fixed_aa_tokens=None,
                 fixed_binder_positions=None,
                 binder_chain_num_idx=None, # Already a global, but passed for clarity/scope
-                binder_entity_mask_for_slicing=None
+                binder_entity_mask_for_slicing=None,
+                device=None, optimizer=None
                 ):
 
         prev_sequence=""
@@ -772,7 +776,8 @@ def boltz_hallucination(
                            num_inter_contacts=2, num_intra_contacts=4,  num_optimizing_binder_pos =1,
                            inter_chain_cutoff=21.0, intra_chain_cutoff=14.0, save_trajectory=False,
                            # New parameters for fixed residues for loss masking
-                           variable_mask_1d_binder=None, binder_entity_mask_for_slicing=None, device=None): # device is already global in hallucination
+                           variable_mask_1d_binder=None, binder_entity_mask_for_slicing=None,
+                           device=None, optimizer=None): # device is already global in hallucination
             traj_coords = None
             traj_plddt = None
 
@@ -937,51 +942,115 @@ def boltz_hallucination(
             return total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
         
         # Modify update_sequence signature and logic
-        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A', # binder_chain is letter
-                            # New parameters for fixed residues
-                            fixed_residues_info=None, fixed_aa_tokens=None,
-                            fixed_binder_positions=None, binder_entity_mask_for_slicing=None):
-            batch["logits"] = alpha*batch['res_type_logits']
-            # Exclude certain tokens from softmax calculation globally (pad, gap, CYS, UNK, nucleic)
-            # Note: CYS is often specifically handled or allowed, this is a strong exclusion.
-            # This global exclusion might conflict with fixed CYS residues if not handled carefully.
-            # The fixed residue clamping later should override this for specific fixed positions.
-            excluded_indices_for_softmax = [0,1,6,22,23,24,25,26,27,28,29,30,31,32] # Pad, Gap, CYS, UNK, Nucleic
+        def update_sequence(opt, batch, mask, alpha=2.0, non_protein_target=False, binder_chain='A',
+                          fixed_residues_info=None, fixed_aa_tokens=None,
+                          fixed_binder_positions=None, binder_entity_mask_for_slicing=None,
+                          variable_mask_1d_binder=None, fixed_mask_1d_binder=None):
+                          
+          
+          # ======================= ここから修正箇所 =======================
+          # 関数に渡される全てのテンソルを、念のため同じデバイスに統一する
+          binder_entity_mask_for_slicing = binder_entity_mask_for_slicing.to(device)
+          variable_mask_1d_binder = variable_mask_1d_binder.to(device)
+          fixed_mask_1d_binder = fixed_mask_1d_binder.to(device)
+          fixed_binder_positions = fixed_binder_positions.to(device)
+          fixed_aa_tokens = fixed_aa_tokens.to(device)
+          # ======================= ここまで修正箇所 =======================
+          
+          # 1. バインダー鎖のlogitsとそれ以外のlogitsを分離
+          binder_logits = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+          
+          # 2. バインダー鎖の中から、可変残基と固定残基のlogitsを分離
+          variable_binder_logits = binder_logits[variable_mask_1d_binder, :]
+          
+          # 3. 可変残基部分のみでSoftmaxとHardmaxを計算
+          excluded_indices_for_softmax = [0,1,6,22,23,24,25,26,27,28,29,30,31,32]
+          allowed_tokens_mask = torch.ones(variable_binder_logits.shape[-1], dtype=torch.bool, device=device)
+          allowed_tokens_mask[excluded_indices_for_softmax] = False
 
-            # Create a mask for allowed tokens in softmax
-            allowed_tokens_mask = torch.ones_like(batch['logits'][0,0,:], dtype=torch.bool, device=device)
-            allowed_tokens_mask[excluded_indices_for_softmax] = False
+          X = alpha * variable_binder_logits
+          X[..., ~allowed_tokens_mask] = -1e9
+          soft_variable = torch.softmax(X / opt["temp"], dim=-1)
 
-            X = batch['logits'].clone() # Clone to avoid modifying res_type_logits directly here
-            X[..., ~allowed_tokens_mask] = -1e9 # Apply penalty to excluded tokens for softmax
+          hard_variable = torch.zeros_like(soft_variable).scatter_(-1, soft_variable.max(dim=-1, keepdim=True)[1], 1.0)
+          hard_variable = (hard_variable - soft_variable).detach() + soft_variable
 
-            batch['soft'] = torch.softmax(X/opt["temp"],dim=-1)
-            batch['hard'] =  torch.zeros_like(batch['soft']).scatter_(-1, batch['soft'].max(dim=-1, keepdim=True)[1], 1.0)
-            batch['hard'] =  (batch['hard'] - batch['soft']).detach() + batch['soft']
-            batch['pseudo'] =  opt["soft"] * batch["soft"] + (1-opt["soft"]) * batch["res_type_logits"] # use original logits for pseudo
-            batch['pseudo'] = opt["hard"] * batch["hard"] + (1-opt["hard"]) * batch["pseudo"]
+          pseudo_variable = opt["soft"] * soft_variable + (1 - opt["soft"]) * variable_binder_logits
+          pseudo_variable = opt["hard"] * hard_variable + (1 - opt["hard"]) * pseudo_variable
 
-            # Original application of mask (presumably to apply pseudo only to binder)
-            batch['res_type'] = batch['pseudo']*mask + batch['res_type_logits']*(1-mask)
+          # 4. 固定残基部分の`res_type`を生成（one-hotベクトル）
+          fixed_one_hot = torch.zeros(len(fixed_binder_positions), batch['res_type'].shape[-1], device=device)
+          # .to(device)は上で処理済みだが、念のため残しておく
+          fixed_one_hot.scatter_(1, fixed_aa_tokens.to(device).unsqueeze(1), 1.0,)
+          
+          # 5. `batch['res_type']`を再構築する
+          # logitsではなく、前のイテレーションの正しいone-hot表現からクローンする
+          new_res_type = batch['res_type'].clone().detach()
+          
+          # binder chain部分のスライスを取得
+          binder_res_type_slice = new_res_type[0, binder_entity_mask_for_slicing, :]
+          
+          # 可変残基と固定残基の部分を、計算した新しいone-hot表現で上書き
+          binder_res_type_slice[variable_mask_1d_binder, :] = pseudo_variable
+          binder_res_type_slice[fixed_mask_1d_binder, :] = fixed_one_hot
+          
+          # 更新したスライスを元のテンソルに戻す
+          new_res_type[0, binder_entity_mask_for_slicing, :] = binder_res_type_slice
+          
+          batch['res_type'] = new_res_type
 
-            # Clamp res_type for fixed residues on the binder chain
-            if fixed_residues_info is not None and len(fixed_aa_tokens) > 0 and binder_entity_mask_for_slicing is not None:
-                with torch.no_grad():
-                    res_type_binder_slice_in_update = batch['res_type'][0, binder_entity_mask_for_slicing, :]
-                    res_type_binder_slice_in_update[fixed_binder_positions, :] = 0.0
-                    res_type_binder_slice_in_update.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1.0)
-        
-            if non_protein_target:
-                batch['msa'] = batch['res_type'].unsqueeze(0).to(device).detach()
-                batch['profile'] = batch['msa'].float().mean(dim=0).to(device).detach()
-            else:
-                batch['msa'][:,0,:,:] = batch['res_type'].to(device).detach()
-                batch['profile'][batch['entity_id']==chain_to_number[binder_chain],:] = batch['msa'][:, 0, (batch['entity_id']==chain_to_number[binder_chain])[0],:].float().mean(dim=1).to(device).detach()
 
-            return batch
+          # 6. MSAとprofileの更新
+          if non_protein_target:
+              batch['msa'] = batch['res_type'].unsqueeze(0).to(device)
+              batch['profile'] = batch['msa'].float().mean(dim=0).to(device)
+          else:
+              # 元のコードでは batch['profile'] の更新でバッチサイズが1でない場合を想定していなかった可能性があるため修正
+              # entity_id のマスクはバッチ次元を持たないため、正しくブロードキャストされるように調整
+              binder_mask_expanded = batch['entity_id'] == chain_to_number[binder_chain]
+              batch['msa'][:,0,:,:] = batch['res_type'].to(device)
+              # binder部分のprofileのみを更新
+              batch['profile'][binder_mask_expanded,:] = batch['msa'][:, 0, binder_mask_expanded[0],:].float().mean(dim=1).to(device)
+          
+          return batch
+
+      
+        with yaml_path.open("r") as file:
+            data = yaml.safe_load(file)
+            
+
+        # Parameter Handling & Initialization for fixed residues
+        binder_chain_letter = binder_chain
+        binder_chain_num_idx = chain_to_number[binder_chain_letter]
+        binder_protein_info = data['sequences'][binder_chain_num_idx]['protein']
+        binder_sequence_from_yaml = binder_protein_info['sequence']
+
+        # Override 'length' parameter with the actual length from YAML
+        length = len(binder_sequence_from_yaml)
+
+        # The line data['sequences'][chain_to_number[binder_chain]]['protein']['sequence'] = 'X'*length
+        # is removed because the sequence is now read from YAML. If fixed residues are present,
+        # the sequence in YAML (e.g., "CXXXXXC") is the source of truth for length and content.
+        # If 'fixed_residues' is not in YAML, input_utils.py would have set 'sequence' to 'X'*100 (default) or from binder_native_sequence.
+
+        fixed_residues_info_1_letter = binder_protein_info.get('fixed_residues') # List[Tuple[str, int]] or None
+
+        name = yaml_path.stem
+        target = parse_boltz_schema(name, data, ccd_lib) # data now contains the potentially fixed sequence
+
+        # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # Original line
+        # Assuming boltz_model is already on the correct device or device is determined globally
+        device = boltz_model.device # Make sure boltz_model has a .device attribute
+
+        fixed_mask_1d_binder, variable_mask_1d_binder, fixed_aa_tokens, fixed_binder_positions = \
+            get_fixed_residue_properties(fixed_residues_info_1_letter, length, device, tokens)
+
+
+        binder_entity_mask_for_slicing = (batch['entity_id'] == binder_chain_num_idx).squeeze(0)
         
         m = {"soft":[soft,e_soft],"temp":[temp,e_temp],"hard":[hard,e_hard], "step":[step,e_step], 'num_optimizing_binder_pos':[num_optimizing_binder_pos, e_num_optimizing_binder_pos]}
         m = {k:[s,(s if e is None else e)] for k,(s,e) in m.items()}
+
 
         opt = {}
         traj_coords_list = []
@@ -1007,8 +1076,11 @@ def boltz_hallucination(
             batch = update_sequence(opt, batch, mask, non_protein_target=non_protein_target, binder_chain=binder_chain, # binder_chain is letter
                                     fixed_residues_info=fixed_residues_info, fixed_aa_tokens=fixed_aa_tokens,
                                     fixed_binder_positions=fixed_binder_positions,
-                                    binder_entity_mask_for_slicing=binder_entity_mask_for_slicing)
-
+                                    binder_entity_mask_for_slicing=binder_entity_mask_for_slicing,
+                                     variable_mask_1d_binder=variable_mask_1d_binder, 
+                                     fixed_mask_1d_binder=fixed_mask_1d_binder
+                                  )
+    
             # Update call to get_model_loss
             total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt = get_model_loss(
                 batch, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history,
@@ -1020,7 +1092,7 @@ def boltz_hallucination(
                 # Pass new mask parameters
                 variable_mask_1d_binder=variable_mask_1d_binder,
                 binder_entity_mask_for_slicing=binder_entity_mask_for_slicing,
-                device=device # Pass device
+                device=device,optimizer=optimizer# Pass device
             )
             traj_coords_list.append(traj_coords)
             traj_plddt_list.append(traj_plddt)
@@ -1047,11 +1119,16 @@ def boltz_hallucination(
                 optimizer.step()
 
                 # Logits Clamping for fixed residues
+                # optimizer.step() によって更新されたlogitsを、再度強制的に固定する。
+                # これにより、固定残基のlogit値が最適化ステップを通じて変更されるのを完全に防ぐ。
                 if fixed_residues_info is not None and len(fixed_aa_tokens) > 0:
-                    with torch.no_grad():
-                        current_logits_binder_slice = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
-                        current_logits_binder_slice[fixed_binder_positions, :] = -1e9 # Others very unlikely
-                        current_logits_binder_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9) # Fixed AA very likely
+                  with torch.no_grad():
+                    # バインダー鎖に対応するlogitsのスライスを取得
+                    current_logits_binder_slice = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
+                    # 固定したい位置の他のアミノ酸のlogitを非常に小さい値にする
+                    current_logits_binder_slice[fixed_binder_positions, :] = -1e9
+                    # 固定したいアミノ酸のlogitを非常に大きい値（実質的に常に選択される状態）に設定する
+                    current_logits_binder_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
 
                 optimizer.zero_grad()
                 current_lr = optimizer.param_groups[0]['lr']
@@ -1061,6 +1138,24 @@ def boltz_hallucination(
 
     # Ensure all newly added parameters to 'design' are passed in these calls
     # This requires adding fixed_residues_info, fixed_mask_1d_binder, etc. to these calls.
+
+    # YAMLファイルから再度情報を読み込む
+    with yaml_path.open("r") as file:
+        data_for_fix = yaml.safe_load(file)
+    binder_protein_info_for_fix = data_for_fix['sequences'][binder_chain_num_idx]['protein']
+    fixed_residues_info_1_letter_for_fix = binder_protein_info_for_fix.get('fixed_residues')
+    binder_sequence_from_yaml_for_fix = binder_protein_info_for_fix['sequence']
+    length_for_fix = len(binder_sequence_from_yaml_for_fix)
+
+
+    # `get_fixed_residue_properties`を再実行して、最新かつ正確なマスクとトークンIDを取得
+    fixed_mask_1d_binder_safe, variable_mask_1d_binder_safe, fixed_aa_tokens_safe, fixed_binder_positions_safe = \
+        get_fixed_residue_properties(fixed_residues_info_1_letter_for_fix, length_for_fix, device, tokens)
+        
+    # `binder_entity_mask_for_slicing`も最新のbatchから再生成する
+    binder_entity_mask_for_slicing_safe = (batch['entity_id'] == binder_chain_num_idx).squeeze(0)
+
+
 
     if pre_run:
         batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = design(
@@ -1073,10 +1168,13 @@ def boltz_hallucination(
             non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
             intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
             num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-            fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-            variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-            fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-            binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+            fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+            fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+            variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+            fixed_aa_tokens=fixed_aa_tokens_safe,
+            fixed_binder_positions=fixed_binder_positions_safe, 
+            binder_chain_num_idx=binder_chain_num_idx,
+            device=device,optimizer=optimizer
         )
     else:
         if design_algorithm == "3stages":
@@ -1093,10 +1191,13 @@ def boltz_hallucination(
                 optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
                 inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
                 num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             print('-'*100)
             print("softmax(T=1) to softmax(T=0.01)")
@@ -1116,10 +1217,13 @@ def boltz_hallucination(
                 non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
                 intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
                 num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             print('-'*100)
             print("hard")
@@ -1135,10 +1239,13 @@ def boltz_hallucination(
                 non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
                 intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
                 num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             traj_coords_list = traj_coords_list1 + traj_coords_list2 + traj_coords_list3 if save_trajectory else []
             traj_plddt_list = traj_plddt_list1 + traj_plddt_list2 + traj_plddt_list3 if save_trajectory else []
@@ -1157,10 +1264,13 @@ def boltz_hallucination(
                 optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
                 inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
                 num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             print('-'*100)
             print(f"logits to softmax(T={e_soft_2})")
@@ -1175,10 +1285,13 @@ def boltz_hallucination(
                 optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
                 inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
                 num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             print('-'*100)
             print("softmax(T=1) to softmax(T=0.01)")
@@ -1198,10 +1311,13 @@ def boltz_hallucination(
                 non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
                 intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
                 num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
             print('-'*100)
             print("hard")
@@ -1217,10 +1333,13 @@ def boltz_hallucination(
                 non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff,
                 intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts,
                 num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
 
             traj_coords_list = traj_coords_list1 + traj_coords_list2 + traj_coords_list3 + traj_coords_list4 if save_trajectory else []
@@ -1240,10 +1359,13 @@ def boltz_hallucination(
                 optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target,
                 inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff,
                 num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory,
-                fixed_residues_info=fixed_residues_info_1_letter, fixed_mask_1d_binder=fixed_mask_1d_binder,
-                variable_mask_1d_binder=variable_mask_1d_binder, fixed_aa_tokens=fixed_aa_tokens,
-                fixed_binder_positions=fixed_binder_positions, binder_chain_num_idx=binder_chain_num_idx,
-                binder_entity_mask_for_slicing=binder_entity_mask_for_slicing
+                fixed_residues_info=fixed_residues_info_1_letter_for_fix, 
+                fixed_mask_1d_binder=fixed_mask_1d_binder_safe,
+                variable_mask_1d_binder=variable_mask_1d_binder_safe, 
+                fixed_aa_tokens=fixed_aa_tokens_safe,
+                fixed_binder_positions=fixed_binder_positions_safe, 
+                binder_chain_num_idx=binder_chain_num_idx,
+                device=device,optimizer=optimizer
             )
 
     def _run_model(boltz_model, batch, predict_args):
@@ -1384,45 +1506,45 @@ def boltz_hallucination(
         best_batch = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch.items()}
         best_batch_apo = {key: value.unsqueeze(0).to(device) if key != 'record' else value for key, value in best_batch_apo.items()}
 
-    # Initialize res_type_logits for best_batch
-    if 'res_type' in best_batch:
-        best_batch['res_type_logits'] = best_batch['res_type'].clone().detach().to(device).float()
-    else:
-        # This case should ideally not be reached if get_batch functions as expected.
-        logging.warning("'res_type' not found in best_batch within _update_batches. This might lead to issues.")
-
-    # Apply fixed residues to best_batch['res_type_logits']
-    # This relies on 'res_type_logits' being successfully initialized above.
-    # Variables like fixed_residues_info_1_letter, fixed_aa_tokens, fixed_binder_positions,
-    # binder_chain_num_idx, and device are accessible from the outer scope of boltz_hallucination.
-    if 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and fixed_aa_tokens.numel() > 0 and fixed_binder_positions.numel() > 0:
-        current_binder_entity_mask_for_slicing = (best_batch['entity_id'] == binder_chain_num_idx).squeeze(0)
-
-        if torch.any(current_binder_entity_mask_for_slicing):
-            # Ensure the slice exists and is not empty
-            binder_logits_slice = best_batch['res_type_logits'][0, current_binder_entity_mask_for_slicing, :]
-            if binder_logits_slice.numel() > 0:
-                # Ensure fixed_binder_positions are valid for the current slice length
-                if binder_logits_slice.shape[0] > torch.max(fixed_binder_positions):
-                    binder_logits_slice[fixed_binder_positions, :] = -1e9
-                    binder_logits_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
-                else:
-                    logging.warning(f"fixed_binder_positions (max: {torch.max(fixed_binder_positions)}) are out of bounds for the current binder slice length ({binder_logits_slice.shape[0]}) in _update_batches.")
-            else:
-                logging.warning(f"Binder slice is empty for chain {binder_chain_num_idx} in best_batch['entity_id'] within _update_batches when applying fixed residues.")
+        # Initialize res_type_logits for best_batch
+        if 'res_type' in best_batch:
+            best_batch['res_type_logits'] = best_batch['res_type'].clone().detach().to(device).float()
         else:
-            logging.warning(f"Binder chain {binder_chain_num_idx} not found in best_batch['entity_id'] within _update_batches when applying fixed residues.")
-    elif 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and (fixed_aa_tokens.numel() == 0 or fixed_binder_positions.numel() == 0) and len(fixed_residues_info_1_letter) > 0:
-        # This case means fixed_residues_info_1_letter was provided, but it resulted in empty fixed_aa_tokens/fixed_binder_positions
-        # (e.g. all specified fixed residues were invalid). Log a warning.
-        logging.warning("fixed_residues_info_1_letter was provided but resulted in no valid fixed tokens/positions to apply in _update_batches.")
+            # This case should ideally not be reached if get_batch functions as expected.
+            logging.warning("'res_type' not found in best_batch within _update_batches. This might lead to issues.")
+
+        # Apply fixed residues to best_batch['res_type_logits']
+        # This relies on 'res_type_logits' being successfully initialized above.
+        # Variables like fixed_residues_info_1_letter, fixed_aa_tokens, fixed_binder_positions,
+        # binder_chain_num_idx, and device are accessible from the outer scope of boltz_hallucination.
+        if 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and fixed_aa_tokens.numel() > 0 and fixed_binder_positions.numel() > 0:
+            current_binder_entity_mask_for_slicing = (best_batch['entity_id'] == binder_chain_num_idx).squeeze(0)
+
+            if torch.any(current_binder_entity_mask_for_slicing):
+                # Ensure the slice exists and is not empty
+                binder_logits_slice = best_batch['res_type_logits'][0, current_binder_entity_mask_for_slicing, :]
+                if binder_logits_slice.numel() > 0:
+                    # Ensure fixed_binder_positions are valid for the current slice length
+                    if binder_logits_slice.shape[0] > torch.max(fixed_binder_positions):
+                        binder_logits_slice[fixed_binder_positions, :] = -1e9
+                        binder_logits_slice.scatter_(1, fixed_aa_tokens.unsqueeze(1), 1e9)
+                    else:
+                        logging.warning(f"fixed_binder_positions (max: {torch.max(fixed_binder_positions)}) are out of bounds for the current binder slice length ({binder_logits_slice.shape[0]}) in _update_batches.")
+                else:
+                    logging.warning(f"Binder slice is empty for chain {binder_chain_num_idx} in best_batch['entity_id'] within _update_batches when applying fixed residues.")
+            else:
+                logging.warning(f"Binder chain {binder_chain_num_idx} not found in best_batch['entity_id'] within _update_batches when applying fixed residues.")
+        elif 'res_type_logits' in best_batch and fixed_residues_info_1_letter is not None and (fixed_aa_tokens.numel() == 0 or fixed_binder_positions.numel() == 0) and len(fixed_residues_info_1_letter) > 0:
+            # This case means fixed_residues_info_1_letter was provided, but it resulted in empty fixed_aa_tokens/fixed_binder_positions
+            # (e.g. all specified fixed residues were invalid). Log a warning.
+            logging.warning("fixed_residues_info_1_letter was provided but resulted in no valid fixed tokens/positions to apply in _update_batches.")
 
 
-    # Initialize res_type_logits for best_batch_apo for consistency
-    if 'res_type' in best_batch_apo:
-        best_batch_apo['res_type_logits'] = best_batch_apo['res_type'].clone().detach().to(device).float()
-    else:
-        logging.warning("'res_type' not found in best_batch_apo within _update_batches.")
+        # Initialize res_type_logits for best_batch_apo for consistency
+        if 'res_type' in best_batch_apo:
+            best_batch_apo['res_type_logits'] = best_batch_apo['res_type'].clone().detach().to(device).float()
+        else:
+            logging.warning("'res_type' not found in best_batch_apo within _update_batches.")
 
         return best_batch, best_batch_apo, best_structure, best_structure_apo
 
