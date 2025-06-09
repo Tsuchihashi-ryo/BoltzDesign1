@@ -697,10 +697,10 @@ def boltz_hallucination(
 
     def norm_seq_grad(grad, chain_mask):
         chain_mask = chain_mask.bool()
-        masked_grad = grad[:, chain_mask.squeeze(0), :] 
+        masked_grad = grad[:, chain_mask.squeeze(0), :].clone().detach()
         eff_L = (masked_grad.pow(2).sum(-1, keepdim=True) > 0).sum(-2, keepdim=True)
         gn = masked_grad.norm(dim=(-1, -2), keepdim=True) 
-        return grad * torch.sqrt(torch.tensor(eff_L)) / (gn + 1e-7)
+        return grad.clone().detach() * torch.sqrt(torch.tensor(eff_L)) / (gn + 1e-7)
 
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
     best_loss = float('inf')  
@@ -1159,7 +1159,7 @@ def boltz_hallucination(
 
     if pre_run:
         batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = design(
-            batch, iters=pre_iteration, soft=1.0, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate,
+            batch, iters=pre_iteration, soft=1.0, mask=mask, chain_mask=chain_mask, learning_rate=learning_rate_pre,
             length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history,
             con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history,
             sequence_history=sequence_history, pre_run=pre_run, mask_ligand=mask_ligand, distogram_only=distogram_only,
