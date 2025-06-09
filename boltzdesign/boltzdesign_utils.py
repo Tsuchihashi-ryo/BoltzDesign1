@@ -1203,7 +1203,7 @@ def boltz_hallucination(
             print("softmax(T=1) to softmax(T=0.01)")
             print('-'*100)
             print("set res_type_logits to logits")
-            new_logits = (alpha * batch["res_type_logits"]).clone().detach().requires_grad_(True)
+            new_logits = batch["res_type_logits"].clone().detach().requires_grad_(True)
             batch['res_type_logits'] = new_logits
             optimizer = torch.optim.SGD([batch['res_type_logits']], lr=learning_rate)
             batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(
