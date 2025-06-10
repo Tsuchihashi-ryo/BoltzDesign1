@@ -99,7 +99,7 @@ Examples:
     parser.add_argument('--modifications_wt', type=str, default='',
                         help='Modifications (comma-separated, e.g., "S,S")')
     parser.add_argument('--modifications_positions', type=str, default='',
-                        help='Modification positions (comma-separated, matching order)')
+                        help="Modification positions (0-based, comma-separated, e.g., '0,1,10,-1').")
     parser.add_argument('--modification_target', type=str, default='',
                         help='Target ID for modifications (e.g., "A")')
     
@@ -107,7 +107,11 @@ Examples:
     parser.add_argument('--constraint_target', type=str, default='',
                         help='Target ID for constraints (e.g., "A")')
     parser.add_argument('--contact_residues', type=str, default='',
-                        help='Contact residues for constraints (comma-separated, e.g., "99,100,109")')
+                        help="Contact residues for constraints (0-based, comma-separated, e.g., '99,100,-5').")
+    parser.add_argument('--fixed_residues', type=str, default='',
+                        help='Explicitly define fixed residues for the binder. Format: "AA:Index,AA:Index,...". Indices are 0-based and can be negative (e.g., "C:-1,A:0,G:5").')
+    parser.add_argument('--bonds', type=str, default='',
+                        help='Define specific bonds for constraints. Format: "Chain1,ResID1,AtomName1_Chain2,ResID2,AtomName2;...". Indices (ResID1, ResID2) are 0-based and can be negative (e.g., "A,5,SG_A,20,SG;A,10,CB_B,-1,CA").')
 
     # Design parameters
     parser.add_argument('--length_min', type=int, default=100,
@@ -626,6 +630,53 @@ def generate_yaml_config(args, config_obj):
         constraints, modifications = process_design_constraints(target_id_map, args.modifications, args.modifications_positions, args.modification_target, args.contact_residues, args.constraint_target, args.binder_id)
     else:
         constraints, modifications = None, None
+
+    # Parse fixed_residues
+    parsed_fixed_residues_list = []
+    if args.fixed_residues:
+        try:
+            for item in args.fixed_residues.split(','):
+                parts = item.split(':')
+                if len(parts) == 2:
+                    aa = parts[0].strip()
+                    idx = int(parts[1].strip())
+                    parsed_fixed_residues_list.append([aa, idx])
+                else:
+                    logger.warning(f"Skipping malformed fixed_residue item: {item}")
+        except ValueError as e:
+            logger.warning(f"Error parsing fixed_residues string '{args.fixed_residues}': {e}. Skipping fixed_residues.")
+            parsed_fixed_residues_list = [] # Reset if error occurs
+
+    # Parse bonds
+    parsed_bonds_list = []
+    if args.bonds:
+        try:
+            bond_pairs = args.bonds.split(';')
+            for pair_str in bond_pairs:
+                if not pair_str.strip():
+                    continue
+                atom_specs = pair_str.split('_')
+                if len(atom_specs) == 2:
+                    atom1_parts = atom_specs[0].split(',')
+                    atom2_parts = atom_specs[1].split(',')
+                    if len(atom1_parts) == 3 and len(atom2_parts) == 3:
+                        # (Chain1, ResID1, AtomName1)
+                        atom1_data = [atom1_parts[0].strip(), int(atom1_parts[1].strip()), atom1_parts[2].strip()]
+                        # (Chain2, ResID2, AtomName2)
+                        atom2_data = [atom2_parts[0].strip(), int(atom2_parts[1].strip()), atom2_parts[2].strip()]
+                        parsed_bonds_list.append((atom1_data, atom2_data))
+                    else:
+                        logger.warning(f"Skipping malformed bond definition (expected 3 parts per atom spec): {pair_str}")
+                else:
+                    logger.warning(f"Skipping malformed bond pair (expected AtomSpec1_AtomSpec2): {pair_str}")
+        except ValueError as e:
+            logger.warning(f"Error parsing bonds string '{args.bonds}': {e}. Skipping bonds.")
+            parsed_bonds_list = [] # Reset if error occurs
+        except Exception as e: # Catch any other unexpected errors during parsing
+            logger.warning(f"An unexpected error occurred while parsing bonds string '{args.bonds}': {e}. Skipping bonds.")
+            parsed_bonds_list = []
+
+
     target = []
     if args.input_type == "pdb":
         pdb_target_ids = [str(x.strip()) for x in args.pdb_target_ids.split(",")] if args.pdb_target_ids else None
@@ -669,7 +720,9 @@ def generate_yaml_config(args, config_obj):
         constraints=constraints,
         modifications=modifications['data'] if modifications else None,
         modification_target=modifications['target'] if modifications else None,
-        use_msa=args.use_msa
+        use_msa=args.use_msa,
+        explicit_fixed_residues=parsed_fixed_residues_list if parsed_fixed_residues_list else None,
+        bond_definitions=parsed_bonds_list if parsed_bonds_list else None
     )
 
 def setup_pipeline_config(args):

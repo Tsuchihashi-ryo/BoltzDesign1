@@ -236,9 +236,10 @@ def process_design_constraints(target_id_map: dict, modifications: str, modifica
     
     return constraints, modifications
     
-def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None, chain_dict_to_populate: dict = None) -> dict:
+def build_chain_dict(targets: list, target_type: str, binder_id: str, constraints: dict = None, modifications: dict = None, modification_target: str = None, chain_dict_to_populate: dict = None, explicit_fixed_residues=None) -> dict:
     # chain_dict_to_populate is pre-filled with binder information
     # This function now adds target information to it.
+    # explicit_fixed_residues is passed through but primarily used for the binder chain in generate_yaml_for_target_binder
     if chain_dict_to_populate is None: # Should not happen if called from generate_yaml_for_target_binder
         # Fallback, though generate_yaml_for_target_binder should always pass it.
         chain_dict_to_populate = {binder_id: {'type': 'protein', 'sequence': 'X' * 100}}
@@ -274,7 +275,7 @@ def build_chain_dict(targets: list, target_type: str, binder_id: str, constraint
 
     return chain_dict_to_populate, yaml_target_ids
 
-def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, binder_native_sequence: Optional[str] = None) -> dict:
+def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, config="", binder_id='A', constraints: dict = None, modifications: dict = None, modification_target: str = None, use_msa: bool = False, binder_native_sequence: Optional[str] = None, explicit_fixed_residues=None, bond_definitions=None) -> dict:
     """
     Generate YAML content for a small molecule binder with multiple targets and create the YAML file.
     
@@ -289,24 +290,31 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
         modification_target (str): Optional modification target to add to YAML
         use_msa (bool): Whether to use MSA for proteins
         binder_native_sequence (Optional[str]): Native sequence of the binder, e.g., "CXXXXCXX"
+        explicit_fixed_residues (Optional[list]): Explicitly defined fixed residues for the binder.
+        bond_definitions (Optional[list]): Definitions of specific bonds for constraints.
         
     Returns:
         tuple: YAML content dictionary and output path
     """ 
     chain_dict = {}
     parsed_sequence = binder_native_sequence if binder_native_sequence else 'X' * 100
+
     fixed_residues_list = []
-    if binder_native_sequence:
+    if explicit_fixed_residues:
+        fixed_residues_list = explicit_fixed_residues
+    elif binder_native_sequence: # Fallback to old logic if explicit_fixed_residues is not provided
         for i, aa in enumerate(binder_native_sequence):
             if aa != 'X':
                 fixed_residues_list.append([aa, i])
 
     chain_dict[binder_id] = {'type': 'protein', 'sequence': parsed_sequence}
-    if fixed_residues_list:
+    if fixed_residues_list: # This will now use the potentially explicit list
         chain_dict[binder_id]['fixed_residues'] = fixed_residues_list
 
     # Populate target chains
-    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target, chain_dict_to_populate=chain_dict)
+    # Pass explicit_fixed_residues to build_chain_dict if it might be used for targets in the future,
+    # for now, it's primarily for the binder.
+    chain_dict, yaml_target_ids = build_chain_dict(targets, target_type, binder_id, constraints, modifications, modification_target, chain_dict_to_populate=chain_dict, explicit_fixed_residues=explicit_fixed_residues)
 
     # Build sequences list for YAML
     sequences = []
@@ -356,8 +364,26 @@ def generate_yaml_for_target_binder(name:str, target_type: str, targets: list, c
     
     # Create and write YAML content
     yaml_content = {"version": 1, "sequences": sequences}
-    if constraints:
-        yaml_content["constraints"] = [constraints]
+
+    all_constraints_for_yaml = []
+    if constraints: # This is the dict from process_design_constraints (pocket/contact info)
+        all_constraints_for_yaml.append(constraints)
+
+    if bond_definitions:
+        for bond_def in bond_definitions:
+            # bond_def is expected to be ([chain1, res_idx1, atom_name1], [chain2, res_idx2, atom_name2])
+            atom1_data = bond_def[0]
+            atom2_data = bond_def[1]
+            bond_constraint_dict = {
+                'bond': {
+                    'atom1': atom1_data,
+                    'atom2': atom2_data
+                }
+            }
+            all_constraints_for_yaml.append(bond_constraint_dict)
+
+    if all_constraints_for_yaml:
+        yaml_content["constraints"] = all_constraints_for_yaml
 
     output_path = config.YAML_DIR / f"{name}.yaml"
     with open(output_path, 'w') as f:
