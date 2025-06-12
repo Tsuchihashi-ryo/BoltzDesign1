@@ -656,6 +656,7 @@ def boltz_hallucination(
     ## initialize res_type_logits
     if pre_run:
         batch['res_type_logits'] = batch['res_type'].clone().detach().to(device).float() # This is already float
+        batch['res_type_logits'][batch['entity_id']==chain_to_number[binder_chain],:] = 0.1*torch.softmax(torch.distributions.Gumbel(0, 1).sample(batch['res_type'][batch['entity_id']==chain_to_number[binder_chain],:].shape).to(device) - torch.sum(torch.eye(batch['res_type'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10), dim=-1)
         # Apply fixed residues to pre_run logits if they exist
         if fixed_residues_info_1_letter is not None and len(fixed_aa_tokens) > 0:
             logits_binder_slice_for_pre_run = batch['res_type_logits'][0, binder_entity_mask_for_slicing, :]
